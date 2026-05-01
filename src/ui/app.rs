@@ -19448,6 +19448,8 @@ impl super::ftui_adapter::Model for CassApp {
                             data_dir,
                             semantic: false,
                             build_hnsw: false,
+                            hnsw_m: None,
+                            hnsw_ef_construction: None,
                             embedder: "fastembed".to_string(),
                             progress: Some(progress),
                             watch_interval_secs: 30,

@@ -328,17 +328,21 @@ pub fn sql_placeholders(count: usize) -> String {
     result
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SearchFilters {
+    #[serde(default)]
     pub agents: HashSet<String>,
+    #[serde(default)]
     pub workspaces: HashSet<String>,
+    #[serde(default)]
     pub created_from: Option<i64>,
+    #[serde(default)]
     pub created_to: Option<i64>,
     /// Filter by conversation source (local, remote, or specific source ID)
-    #[serde(skip_serializing_if = "SourceFilter::is_all")]
+    #[serde(default, skip_serializing_if = "SourceFilter::is_all")]
     pub source_filter: SourceFilter,
     /// Filter to specific session source paths (for chained searches)
-    #[serde(skip_serializing_if = "HashSet::is_empty")]
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub session_paths: HashSet<String>,
 }
 
@@ -1039,7 +1043,7 @@ impl QueryExplanation {
 
 /// Indicates how a search result matched the query.
 /// Used for ranking: exact matches rank higher than wildcard matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchType {
     /// No wildcards - matched via exact term or edge n-gram prefix
@@ -1072,7 +1076,7 @@ impl MatchType {
 }
 
 /// Type of suggestion for did-you-mean
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SuggestionKind {
     /// Typo correction (Levenshtein distance)
@@ -1088,7 +1092,7 @@ pub enum SuggestionKind {
 }
 
 /// A "did-you-mean" suggestion when search returns zero hits.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QuerySuggestion {
     /// What kind of suggestion this is
     pub kind: SuggestionKind,
@@ -1225,16 +1229,31 @@ impl FieldMask {
     pub fn preview_content_limit(self) -> Option<usize> {
         self.preview_content_chars
     }
+
+    /// Reconstruct a FieldMask from its raw flag bits. Used to ferry the mask
+    /// across the daemon protocol without expanding the wire format every
+    /// time we add a new field.
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            flags: (bits & 0xFF) as u8,
+            preview_content_chars: None,
+        }
+    }
+
+    /// Raw bit representation for serialization.
+    pub fn bits(self) -> u32 {
+        self.flags as u32
+    }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchHit {
     pub title: String,
     pub snippet: String,
     pub content: String,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub content_hash: u64,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub conversation_id: Option<i64>,
     pub score: f32,
     pub source_path: String,

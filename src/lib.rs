@@ -15101,6 +15101,129 @@ mod search_lexical_self_heal_tests {
     }
 }
 
+/// Attempt a warm-search round-trip through the daemon. Returns Some on
+/// success; returns None on any failure or unreachable daemon, so the
+/// caller falls through to the in-process search path. Errors are logged
+/// but not propagated; daemon search is best-effort acceleration.
+#[allow(clippy::too_many_arguments)]
+fn try_warm_daemon_search(
+    query: &str,
+    mode: crate::search::query::SearchMode,
+    limit: usize,
+    offset: usize,
+    sparse_threshold: usize,
+    field_mask: crate::search::query::FieldMask,
+    approximate: bool,
+    semantic_opts: &SemanticSearchOptions,
+    data_dir: &Path,
+    db_path: &Path,
+    agents: &[String],
+    workspaces: &[String],
+    source: Option<&str>,
+    time_filter: &TimeFilter,
+    hybrid_fail_open: bool,
+) -> Option<crate::search::query::SearchResult> {
+    use crate::search::query::SearchMode;
+
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            query,
+            mode,
+            limit,
+            offset,
+            sparse_threshold,
+            field_mask,
+            approximate,
+            semantic_opts,
+            data_dir,
+            db_path,
+            agents,
+            workspaces,
+            source,
+            time_filter,
+            hybrid_fail_open,
+        );
+        None
+    }
+
+    #[cfg(unix)]
+    {
+        use crate::daemon::protocol::SearchRequest;
+
+        let daemon = crate::daemon::client::try_connect()?;
+
+        let mode_str = match mode {
+            SearchMode::Lexical => "lexical",
+            SearchMode::Semantic => "semantic",
+            SearchMode::Hybrid => "hybrid",
+        }
+        .to_string();
+
+        let req = SearchRequest {
+            query: query.to_string(),
+            mode: mode_str,
+            limit,
+            offset,
+            model: semantic_opts.model.clone(),
+            approximate,
+            agents: agents.to_vec(),
+            workspaces: workspaces.to_vec(),
+            source_filter: source.map(str::to_string),
+            since: time_filter.since,
+            until: time_filter.until,
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            db_path: db_path.to_string_lossy().into_owned(),
+            field_mask_bits: field_mask.bits(),
+            sparse_threshold,
+            hybrid_fail_open,
+        };
+
+        let wire = match daemon.search(req) {
+            Ok(wire) => wire,
+            Err(e) => {
+                tracing::debug!(error = %e, "daemon search unavailable; falling back to in-process");
+                return None;
+            }
+        };
+
+        let hits: Vec<crate::search::query::SearchHit> = match serde_json::from_str(&wire.hits_json)
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!(error = %e, "daemon search returned undecodable hits; falling back");
+                return None;
+            }
+        };
+
+        let suggestions: Vec<crate::search::query::QuerySuggestion> =
+            serde_json::from_str(&wire.suggestions_json).unwrap_or_default();
+
+        let ann_stats = match wire.ann_stats_json.as_deref() {
+            Some(json) => serde_json::from_str::<crate::search::ann_index::AnnSearchStats>(json).ok(),
+            None => None,
+        };
+
+        tracing::info!(
+            elapsed_ms = wire.elapsed_ms,
+            warm_load_triggered = wire.warm_load_triggered,
+            warm_load_ms = wire.warm_load_ms,
+            embedder_id = %wire.embedder_id,
+            realized_mode = %wire.realized_mode,
+            "warm daemon search served"
+        );
+
+        Some(crate::search::query::SearchResult {
+            hits,
+            wildcard_fallback: wire.wildcard_fallback,
+            cache_stats: crate::search::query::CacheStats::default(),
+            suggestions,
+            ann_stats,
+            total_count: wire.total_count,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -15367,10 +15490,28 @@ fn run_cli_search(
         eprintln!("Warning: tier flags currently only affect --mode semantic.");
     }
 
-    if matches!(
-        mode_meta.requested,
-        SearchMode::Semantic | SearchMode::Hybrid
-    ) {
+    let daemon_will_handle = semantic_opts.use_daemon
+        && matches!(
+            mode_meta.requested,
+            SearchMode::Semantic | SearchMode::Hybrid
+        )
+        && {
+            #[cfg(unix)]
+            {
+                crate::daemon::client::try_connect().is_some()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+
+    if !daemon_will_handle
+        && matches!(
+            mode_meta.requested,
+            SearchMode::Semantic | SearchMode::Hybrid
+        )
+    {
         use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
 
         // Use embedder registry for model selection (bd-2mbe)
@@ -15570,7 +15711,33 @@ fn run_cli_search(
 
     // Track search timing breakdown (T7.4)
     let search_start = Instant::now();
-    let result = match mode_meta.realized {
+    let daemon_search_result =
+        if semantic_opts.use_daemon && !matches!(mode_meta.realized, SearchMode::Lexical) {
+            try_warm_daemon_search(
+                query,
+                mode_meta.realized,
+                search_limit,
+                search_offset,
+                search_sparse_threshold,
+                field_mask,
+                approximate,
+                &semantic_opts,
+                &data_dir,
+                &db_path,
+                agents,
+                workspaces,
+                source.as_deref(),
+                &time_filter,
+                hybrid_fail_open,
+            )
+        } else {
+            None
+        };
+
+    let result = if let Some(daemon_result) = daemon_search_result {
+        daemon_result
+    } else {
+        match mode_meta.realized {
         SearchMode::Lexical => client
             .search_with_fallback(
                 query,
@@ -15704,6 +15871,7 @@ fn run_cli_search(
                 }
             }
         },
+        }
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
 

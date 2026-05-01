@@ -1,0 +1,60 @@
+# systemd user unit for the cass warm-search daemon.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp this-file ~/.config/systemd/user/cass-daemon.service
+#   loginctl enable-linger $USER          # keep running across logouts
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now cass-daemon
+#
+# Logs:
+#   journalctl --user -u cass-daemon -f
+
+[Unit]
+Description=cass warm search daemon (resident SearchClient + HNSW)
+After=network.target
+
+[Service]
+Type=simple
+
+# Memory cap. Empirically the warm daemon's working set on this corpus is
+# ~22 GB (Tantivy reader + FSVI + HNSW graph + SQLite + query scratch). We
+# set the soft self-shutdown limit at 28 GB so the daemon has comfortable
+# headroom for query bursts without nuking itself, and let the cgroup hard
+# cap (MemoryMax below) bound the worst case so it never OOMs the host.
+Environment=CASS_DAEMON_MEMORY_LIMIT=28000000000
+
+# Idle shutdown after 6 hours of no activity. Set to 0 to keep resident
+# forever (recommended on a dedicated host).
+Environment=CASS_DAEMON_IDLE_TIMEOUT_SECS=21600
+
+# Connection cap. 16 is the default; warm search is fast enough that you
+# rarely need more.
+Environment=CASS_DAEMON_MAX_CONNECTIONS=16
+
+# Niceness. 10 keeps the daemon out of the way of interactive work; the
+# in-process fallback path uses no nice at all so a desperate caller can
+# always still get a fresh search.
+Environment=CASS_DAEMON_NICE=10
+
+ExecStart=%h/.local/bin/cass.real daemon --idle-timeout 21600
+
+# Hard kill if the daemon doesn't come down on SIGTERM in 30s.
+TimeoutStopSec=30
+
+# Restart on failure but cap the loop so a permanently-broken binary
+# doesn't busywake the host.
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# Resource hardening. The cgroup hard cap is the floor of trust: even if
+# the daemon's self-shutdown logic above is broken, the kernel will refuse
+# to let it grow past 32 GB on a 47 GB host.
+MemoryMax=32G
+CPUQuota=400%
+TasksMax=512
+
+[Install]
+WantedBy=default.target

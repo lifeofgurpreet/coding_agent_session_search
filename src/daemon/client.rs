@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use super::daemon_spawn_guard_lock_path;
 use super::protocol::{
     EmbeddingJobInfo, ErrorCode, FramedMessage, HealthStatus, PROTOCOL_VERSION, Request, Response,
-    decode_message, default_socket_path, encode_message,
+    SearchRequest, SearchResponseWire, decode_message, default_socket_path, encode_message,
 };
 use super::worker::EmbeddingJobConfig;
 use crate::search::daemon_client::{DaemonClient, DaemonError};
@@ -52,7 +52,13 @@ impl Default for DaemonClientConfig {
         Self {
             socket_path: default_socket_path(),
             connect_timeout: Duration::from_secs(2),
-            request_timeout: Duration::from_secs(30),
+            // Default 180s. Embed and rerank requests are sub-second; the
+            // long timeout exists to cover the cold warm-search load
+            // (multi-GB FSVI + HNSW) that the daemon pays once on the
+            // first Search request for a given (data_dir, db_path) pair.
+            // Steady-state warm queries finish in tens of milliseconds.
+            // Override with `CASS_DAEMON_REQUEST_TIMEOUT_MS`.
+            request_timeout: Duration::from_secs(180),
             auto_spawn: true,
             daemon_binary: None, // Will use current executable with --daemon flag
         }
@@ -362,8 +368,9 @@ impl UdsDaemonClient {
         }
 
         let len = u32::from_be_bytes(len_buf) as usize;
-        // 10MB sanity limit - typical embedding responses are well under 1MB
-        const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+        // 64MB sanity limit. Embedding responses are well under 1MB; search
+        // responses can be a few MB when content fields are included.
+        const MAX_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
         if len > MAX_RESPONSE_SIZE {
             *stream_guard = None;
             warn!(
@@ -470,6 +477,51 @@ impl UdsDaemonClient {
         })?;
         match response {
             Response::JobStatus(info) => Ok(info),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// Run a warm-search request through the daemon. The first call for a
+    /// given (data_dir, db_path) pays the load cost; later calls are warm.
+    pub fn search(&self, req: SearchRequest) -> Result<SearchResponseWire, DaemonError> {
+        let response = self.send_request(Request::Search(req))?;
+        match response {
+            Response::Search(wire) => Ok(wire),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// Pre-warm a SearchClient on the daemon without running a query.
+    pub fn warm_search(
+        &self,
+        data_dir: &str,
+        db_path: &str,
+        model: Option<&str>,
+    ) -> Result<(String, u64, bool), DaemonError> {
+        let response = self.send_request(Request::WarmSearch {
+            data_dir: data_dir.to_string(),
+            db_path: db_path.to_string(),
+            model: model.map(|s| s.to_string()),
+        })?;
+        match response {
+            Response::SearchWarmed {
+                embedder_id,
+                warm_load_ms,
+                already_warm,
+                ..
+            } => Ok((embedder_id, warm_load_ms, already_warm)),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// Drop the daemon's warm SearchClient for these paths.
+    pub fn evict_search(&self, data_dir: &str, db_path: &str) -> Result<bool, DaemonError> {
+        let response = self.send_request(Request::EvictSearch {
+            data_dir: data_dir.to_string(),
+            db_path: db_path.to_string(),
+        })?;
+        match response {
+            Response::SearchEvicted { was_warm, .. } => Ok(was_warm),
             other => Err(unexpected_response(other)),
         }
     }
@@ -683,7 +735,7 @@ mod tests {
         let config = DaemonClientConfig::default();
         assert!(config.auto_spawn);
         assert_eq!(config.connect_timeout, Duration::from_secs(2));
-        assert_eq!(config.request_timeout, Duration::from_secs(30));
+        assert_eq!(config.request_timeout, Duration::from_secs(180));
     }
 
     #[test]

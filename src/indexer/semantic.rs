@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use frankensearch::index::{
     HNSW_DEFAULT_EF_CONSTRUCTION as FS_HNSW_DEFAULT_EF_CONSTRUCTION,
+    HNSW_DEFAULT_INSERT_BATCH_SIZE as FS_HNSW_DEFAULT_INSERT_BATCH_SIZE,
     HNSW_DEFAULT_M as FS_HNSW_DEFAULT_M, HnswConfig as FsHnswConfig, HnswIndex as FsHnswIndex,
     Quantization as FsQuantization, VectorIndex as FsVectorIndex,
     VectorIndexWriter as FsVectorIndexWriter,
@@ -570,9 +571,9 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     let count: i64 = storage
         .raw()
         .query_row_map(
-            "SELECT COUNT(DISTINCT m.conversation_id)
-             FROM messages m
-             JOIN conversations c ON c.id = m.conversation_id",
+            "SELECT COUNT(*)
+             FROM conversation_tail_state
+             WHERE last_message_idx IS NOT NULL",
             &[] as &[ParamValue],
             |row| row.get_typed(0),
         )
@@ -854,16 +855,32 @@ fn fetch_canonical_embedding_batch(
     after_conversation_id: i64,
     max_conversations: usize,
 ) -> Result<CanonicalEmbeddingBatch> {
+    let trace_enabled = std::env::var_os("CASS_SEMANTIC_BACKFILL_TRACE").is_some();
+    let trace_started = std::time::Instant::now();
+    macro_rules! semantic_trace {
+        ($stage:literal) => {
+            if trace_enabled {
+                eprintln!(
+                    "CASS_SEMANTIC_BACKFILL_TRACE semantic_stage={} elapsed_ms={}",
+                    $stage,
+                    trace_started.elapsed().as_millis()
+                );
+            }
+        };
+    }
+    semantic_trace!("before_total");
     let total_conversations = total_semantic_conversations(storage)?;
+    semantic_trace!("after_total");
     let max_conversations_i64 = i64::try_from(max_conversations.max(1)).unwrap_or(i64::MAX);
+    semantic_trace!("before_ids");
     let conversation_ids: Vec<i64> = storage
         .raw()
         .query_map_collect(
-            "SELECT DISTINCT m.conversation_id
-             FROM messages m
-             JOIN conversations c ON c.id = m.conversation_id
-             WHERE m.conversation_id > ?1
-             ORDER BY m.conversation_id ASC
+            "SELECT conversation_id
+             FROM conversation_tail_state
+             WHERE conversation_id > ?1
+               AND last_message_idx IS NOT NULL
+             ORDER BY conversation_id ASC
              LIMIT ?2",
             &[
                 ParamValue::from(after_conversation_id),
@@ -874,6 +891,7 @@ fn fetch_canonical_embedding_batch(
         .with_context(|| {
             format!("fetching semantic backfill conversation ids after {after_conversation_id}")
         })?;
+    semantic_trace!("after_ids");
 
     if conversation_ids.is_empty() {
         return Ok(CanonicalEmbeddingBatch {
@@ -884,10 +902,14 @@ fn fetch_canonical_embedding_batch(
         });
     }
 
+    semantic_trace!("before_envelopes");
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
+    semantic_trace!("after_envelopes");
 
+    semantic_trace!("before_messages");
     let mut grouped_messages =
         storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+    semantic_trace!("after_messages");
     let mut inputs = Vec::new();
     for conversation in &conversations {
         let messages = grouped_messages
@@ -901,6 +923,7 @@ fn fetch_canonical_embedding_batch(
             &packet,
         ));
     }
+    semantic_trace!("after_inputs");
 
     let conversations_in_batch = u64::try_from(conversation_ids.len()).unwrap_or(u64::MAX);
     tracing::debug!(
@@ -1845,20 +1868,39 @@ impl SemanticIndexer {
         m: Option<usize>,
         ef_construction: Option<usize>,
     ) -> Result<PathBuf> {
-        let m = m.unwrap_or(FS_HNSW_DEFAULT_M);
-        let ef_construction = ef_construction.unwrap_or(FS_HNSW_DEFAULT_EF_CONSTRUCTION);
+        let m = m
+            .or_else(|| {
+                std::env::var("CASS_HNSW_M")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(FS_HNSW_DEFAULT_M);
+        let ef_construction = ef_construction
+            .or_else(|| {
+                std::env::var("CASS_HNSW_EF_CONSTRUCTION")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(FS_HNSW_DEFAULT_EF_CONSTRUCTION);
+        let insert_batch_size = std::env::var("CASS_HNSW_INSERT_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(FS_HNSW_DEFAULT_INSERT_BATCH_SIZE);
 
         tracing::info!(
             embedder = self.embedder_id(),
             count = vector_index.record_count(),
             m,
             ef_construction,
+            insert_batch_size,
             "Building HNSW index for approximate nearest neighbor search"
         );
 
         let config = FsHnswConfig {
             m,
             ef_construction,
+            insert_batch_size,
             ..FsHnswConfig::default()
         };
         let hnsw = FsHnswIndex::build_from_vector_index(vector_index, config)

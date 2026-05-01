@@ -21,10 +21,11 @@ use super::daemon_run_lock_path;
 use super::models::ModelManager;
 use super::protocol::{
     EmbedResponse, EmbeddingJobDetail, EmbeddingJobInfo, ErrorCode, ErrorResponse, FramedMessage,
-    HealthStatus, ModelInfo, PROTOCOL_VERSION, Request, RerankResponse, Response, StatusResponse,
-    decode_message, default_socket_path, encode_message,
+    HealthStatus, ModelInfo, PROTOCOL_VERSION, Request, RerankResponse, Response, SearchRequest,
+    StatusResponse, decode_message, default_socket_path, encode_message,
 };
 use super::resource::ResourceMonitor;
+use super::warm_search::WarmSearchRegistry;
 use super::worker::{EmbeddingJobConfig, EmbeddingWorker, EmbeddingWorkerHandle};
 
 struct BoundDaemonSocket {
@@ -247,6 +248,7 @@ pub struct ModelDaemon {
     shutdown: AtomicBool,
     last_activity: RwLock<Instant>,
     worker_handle: parking_lot::Mutex<Option<EmbeddingWorkerHandle>>,
+    warm_search: Arc<WarmSearchRegistry>,
 }
 
 impl ModelDaemon {
@@ -262,6 +264,7 @@ impl ModelDaemon {
             shutdown: AtomicBool::new(false),
             last_activity: RwLock::new(Instant::now()),
             worker_handle: parking_lot::Mutex::new(None),
+            warm_search: Arc::new(WarmSearchRegistry::new()),
         }
     }
 
@@ -820,6 +823,27 @@ impl ModelDaemon {
                 }
             }
 
+            Request::Search(req) => self.handle_search(&request_id, req, start),
+
+            Request::WarmSearch {
+                data_dir,
+                db_path,
+                model,
+            } => self.handle_warm_search(&request_id, &data_dir, &db_path, model.as_deref()),
+
+            Request::EvictSearch { data_dir, db_path } => {
+                let key = crate::daemon::warm_search::WarmKey::from_paths(
+                    Path::new(&data_dir),
+                    Path::new(&db_path),
+                );
+                let was_warm = self.warm_search.evict(&key);
+                Response::SearchEvicted {
+                    data_dir,
+                    db_path,
+                    was_warm,
+                }
+            }
+
             Request::Shutdown => {
                 info!(request_id = %request_id, "Shutdown requested");
                 self.shutdown.store(true, Ordering::SeqCst);
@@ -827,6 +851,104 @@ impl ModelDaemon {
                     message: "daemon shutting down".to_string(),
                 }
             }
+        }
+    }
+
+    /// Run a warm-search query. The first call for a given (data_dir, db_path)
+    /// pays the SearchClient + semantic-context load cost; every subsequent
+    /// call hits in-memory state and runs in tens of milliseconds.
+    fn handle_search(&self, request_id: &str, req: SearchRequest, start: Instant) -> Response {
+        debug!(
+            request_id = %request_id,
+            mode = %req.mode,
+            data_dir = %req.data_dir,
+            "Processing search request"
+        );
+
+        let data_dir = PathBuf::from(&req.data_dir);
+        let db_path = PathBuf::from(&req.db_path);
+
+        let (entry, warm_load_triggered, warm_load_ms) =
+            match self
+                .warm_search
+                .get_or_warm(&data_dir, &db_path, req.model.as_deref())
+            {
+                Ok(triple) => triple,
+                Err(e) => {
+                    error!(
+                        request_id = %request_id,
+                        error = %e,
+                        "warm search load failed"
+                    );
+                    return Response::Error(ErrorResponse {
+                        code: ErrorCode::ModelLoadFailed,
+                        message: format!("warm search load failed: {e}"),
+                        retryable: false,
+                        retry_after_ms: None,
+                    });
+                }
+            };
+
+        match crate::daemon::warm_search::run_search_on_entry(&entry, &req) {
+            Ok(wire) => {
+                let mut wire = wire;
+                wire.warm_load_triggered = warm_load_triggered;
+                wire.warm_load_ms = warm_load_ms;
+                wire.elapsed_ms = start.elapsed().as_millis() as u64;
+                entry.last_used_unix_millis.store(
+                    crate::daemon::warm_search::now_unix_millis(),
+                    Ordering::Relaxed,
+                );
+                entry.query_count.fetch_add(1, Ordering::Relaxed);
+                Response::Search(wire)
+            }
+            Err(e) => {
+                error!(
+                    request_id = %request_id,
+                    error = %e,
+                    "warm search query failed"
+                );
+                Response::Error(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("search failed: {e}"),
+                    retryable: false,
+                    retry_after_ms: None,
+                })
+            }
+        }
+    }
+
+    /// Pre-warm a SearchClient without running a query. Used for daemon
+    /// startup pre-warming or post-rebuild reload.
+    fn handle_warm_search(
+        &self,
+        request_id: &str,
+        data_dir_str: &str,
+        db_path_str: &str,
+        model: Option<&str>,
+    ) -> Response {
+        debug!(
+            request_id = %request_id,
+            data_dir = %data_dir_str,
+            "Processing warm-search request"
+        );
+        let data_dir = PathBuf::from(data_dir_str);
+        let db_path = PathBuf::from(db_path_str);
+
+        match self.warm_search.get_or_warm(&data_dir, &db_path, model) {
+            Ok((entry, warm_load_triggered, warm_load_ms)) => Response::SearchWarmed {
+                data_dir: data_dir_str.to_string(),
+                db_path: db_path_str.to_string(),
+                embedder_id: entry.embedder_id.clone(),
+                warm_load_ms,
+                already_warm: !warm_load_triggered,
+            },
+            Err(e) => Response::Error(ErrorResponse {
+                code: ErrorCode::ModelLoadFailed,
+                message: format!("warm search load failed: {e}"),
+                retryable: false,
+                retry_after_ms: None,
+            }),
         }
     }
 

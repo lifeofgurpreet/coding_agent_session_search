@@ -109,6 +109,8 @@ fn run_cell(label: &str, governor: &str, combine: &str, shadow: &str, corpus_siz
         data_dir: data_dir.clone(),
         semantic: false,
         build_hnsw: false,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
         embedder: "fastembed".to_string(),
         progress: None,
         watch_interval_secs: 30,
