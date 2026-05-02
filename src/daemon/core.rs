@@ -406,6 +406,29 @@ impl ModelDaemon {
         }
         info!("Model pre-warming complete");
 
+        // Pre-bind the warm SearchClient (FSVI + HNSW + Tantivy + filter maps)
+        // for the default data dir so the first user query doesn't pay the
+        // 30-90s lazy-bind cost. Phase 2 (2026-05-02) — gated by
+        // CASS_DAEMON_PREWARM_SEARCH=1 so existing operators can opt in.
+        if std::env::var("CASS_DAEMON_PREWARM_SEARCH").as_deref() == Ok("1") {
+            let data_dir = crate::default_data_dir();
+            let db_path = crate::default_db_path();
+            info!(
+                data_dir = %data_dir.display(),
+                db_path = %db_path.display(),
+                "Pre-binding warm search context..."
+            );
+            match self.warm_search.get_or_warm(&data_dir, &db_path, None) {
+                Ok((entry, triggered, warm_load_ms)) => info!(
+                    embedder = %entry.embedder_id,
+                    warm_load_ms = warm_load_ms,
+                    triggered = triggered,
+                    "Warm search context bound"
+                ),
+                Err(e) => warn!(error = %e, "Failed to pre-bind warm search context"),
+            }
+        }
+
         // Start background embedding worker
         self.init_worker();
 
