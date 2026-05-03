@@ -331,6 +331,42 @@ fn open_warm_client(
                     prefer_hash, bound_embedder_id
                 )
             })?;
+
+        // Eagerly load the HNSW accelerator at warm time so the first user
+        // approximate-semantic query doesn't pay the multi-second
+        // `reload_hnsw` cost (~15-55 s on the production corpus, dominated
+        // by faulting the 1.3 GB graph data file from disk into the daemon's
+        // address space). Set CASS_DAEMON_PREWARM_ANN=0 to skip — useful
+        // when the daemon is being restarted under memory pressure and the
+        // page cache is cold; the lazy-load path still works.
+        let prewarm_ann =
+            std::env::var("CASS_DAEMON_PREWARM_ANN").as_deref() != Ok("0");
+        if prewarm_ann {
+            let warmup_started = Instant::now();
+            match client.warmup_ann() {
+                Ok(true) => {
+                    tracing::info!(
+                        warmup_ann_ms = warmup_started.elapsed().as_millis() as u64,
+                        embedder = %bound_embedder_id,
+                        "HNSW accelerator warmed at daemon startup",
+                    );
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        embedder = %bound_embedder_id,
+                        "no HNSW accelerator on disk; approximate search will fall back",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        embedder = %bound_embedder_id,
+                        error = %err,
+                        "HNSW accelerator warmup failed; first --approximate query \
+                         will pay the lazy-load cost (or fall back to brute force)",
+                    );
+                }
+            }
+        }
     } else {
         // Lexical-only warm. Still useful: keeps Tantivy reader resident.
         let summary = match &setup.availability {

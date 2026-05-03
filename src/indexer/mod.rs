@@ -74,7 +74,7 @@ use semantic::{
 
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
 use crate::search::semantic_manifest::{
-    ArtifactRecord, SemanticManifest, TierKind as SemanticTierKind,
+    ArtifactRecord, HnswRecord, SemanticManifest, TierKind as SemanticTierKind,
 };
 
 #[cfg(test)]
@@ -6382,6 +6382,71 @@ fn publish_direct_semantic_artifact(
     Ok(())
 }
 
+/// Register a freshly-built HNSW accelerator with the semantic manifest so the
+/// daemon's auto-load path picks it up without `--approximate`.  Sums the
+/// `.chsw` metadata file with the two `hnsw-rs` sidecar files (`*.hnsw.graph`
+/// and `*.hnsw.data`) for a meaningful `size_bytes`.
+fn publish_direct_hnsw_artifact(
+    data_dir: &Path,
+    hnsw_path: &Path,
+    embedder_id: &str,
+) -> Result<()> {
+    let Some(tier) = semantic_tier_for_embedder_id(embedder_id) else {
+        tracing::debug!(
+            embedder = embedder_id,
+            "skipping direct HNSW manifest publish: unknown embedder tier"
+        );
+        return Ok(());
+    };
+
+    let chsw_size = fs::metadata(hnsw_path)
+        .with_context(|| format!("stat HNSW chsw {}", hnsw_path.display()))?
+        .len();
+    let sidecar_size: u64 = ["hnsw-rs.hnsw.graph", "hnsw-rs.hnsw.data"]
+        .iter()
+        .map(|ext| {
+            let stem = hnsw_path.file_stem().unwrap_or_default().to_string_lossy();
+            let sidecar = hnsw_path.with_file_name(format!("{stem}.{ext}"));
+            fs::metadata(&sidecar).map(|m| m.len()).unwrap_or(0)
+        })
+        .sum();
+    let size_bytes = chsw_size + sidecar_size;
+
+    let relative_index_path = hnsw_path
+        .strip_prefix(data_dir)
+        .unwrap_or(hnsw_path)
+        .to_string_lossy()
+        .into_owned();
+
+    let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
+        anyhow::anyhow!("loading semantic manifest for direct HNSW publish: {err}")
+    })?;
+    manifest.publish_hnsw(HnswRecord {
+        base_tier: tier,
+        embedder_id: embedder_id.to_string(),
+        ef_search: HNSW_DEFAULT_EF_SEARCH_HINT,
+        index_path: relative_index_path,
+        size_bytes,
+        built_at_ms: semantic_indexing_now_ms(),
+        ready: true,
+    });
+    manifest
+        .save(data_dir)
+        .map_err(|err| anyhow::anyhow!("saving semantic manifest after HNSW publish: {err}"))?;
+    tracing::info!(
+        embedder = embedder_id,
+        tier = tier.as_str(),
+        size_bytes,
+        "published direct HNSW artifact to manifest"
+    );
+    Ok(())
+}
+
+/// ef_search hint stored in the manifest at build time.  The runtime ef can
+/// still be overridden at search time; this just gives `cass status` and the
+/// daemon a sensible default to surface.
+const HNSW_DEFAULT_EF_SEARCH_HINT: usize = 128;
+
 fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
     let total_messages: i64 = storage
         .raw()
@@ -10545,7 +10610,47 @@ pub fn run_index(
                 .unwrap_or(false);
         let has_watermark = storage.get_last_embedded_message_id()?.is_some();
 
-        if opts.watch && has_existing_index && has_watermark {
+        let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+        let existing_vector_path = crate::search::vector_index::vector_index_path(
+            &opts.data_dir,
+            semantic_indexer.embedder_id(),
+        );
+
+        if opts.build_hnsw && existing_vector_path.is_file() {
+            tracing::info!(
+                path = %existing_vector_path.display(),
+                embedder = semantic_indexer.embedder_id(),
+                "building HNSW from existing semantic vector index without re-embedding"
+            );
+            let vector_index = crate::search::vector_index::VectorIndex::open(
+                &existing_vector_path,
+            )
+            .map_err(|err| anyhow::anyhow!("open existing semantic vector index failed: {err}"))?;
+            let hnsw_path = semantic_indexer.build_hnsw_index(
+                &vector_index,
+                &opts.data_dir,
+                opts.hnsw_m,
+                opts.hnsw_ef_construction,
+            )?;
+            tracing::info!(
+                path = %hnsw_path.display(),
+                embedder = semantic_indexer.embedder_id(),
+                "saved HNSW index for existing semantic vector index"
+            );
+            if let Err(err) = publish_direct_hnsw_artifact(
+                &opts.data_dir,
+                &hnsw_path,
+                semantic_indexer.embedder_id(),
+            ) {
+                tracing::warn!(
+                    embedder = semantic_indexer.embedder_id(),
+                    error = %err,
+                    "HNSW sidecars on disk but manifest publish failed; \
+                     daemon will fall back to brute-force semantic until \
+                     manifest is repaired"
+                );
+            }
+        } else if opts.watch && has_existing_index && has_watermark {
             tracing::info!(
                 dir = %vi_dir.display(),
                 "skipping bulk semantic re-embed (existing index + watermark found); \
@@ -10610,6 +10715,19 @@ pub fn run_index(
                         embedder = semantic_indexer.embedder_id(),
                         "saved HNSW index for approximate search"
                     );
+                    if let Err(err) = publish_direct_hnsw_artifact(
+                        &opts.data_dir,
+                        &hnsw_path,
+                        semantic_indexer.embedder_id(),
+                    ) {
+                        tracing::warn!(
+                            embedder = semantic_indexer.embedder_id(),
+                            error = %err,
+                            "HNSW sidecars on disk but manifest publish failed; \
+                             daemon will fall back to brute-force semantic until \
+                             manifest is repaired"
+                        );
+                    }
                 }
 
                 // Publish the artifact to the semantic manifest so `cass

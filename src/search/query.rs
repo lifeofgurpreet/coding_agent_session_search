@@ -3882,6 +3882,28 @@ impl SearchClient {
         Ok(())
     }
 
+    /// Force-load the HNSW accelerator so the next approximate-search call
+    /// doesn't pay the multi-second `reload_hnsw` cost. Returns Ok(false) if
+    /// no `ann_path` is bound (no HNSW available); Ok(true) if loaded
+    /// successfully. Errors propagate when the file is present but invalid.
+    pub fn warmup_ann(&self) -> Result<bool> {
+        let has_ann_path = {
+            let guard = self
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            guard
+                .as_ref()
+                .and_then(|s| s.ann_path.as_ref())
+                .is_some_and(|p| p.is_file())
+        };
+        if !has_ann_path {
+            return Ok(false);
+        }
+        let _ = self.ann_index()?;
+        Ok(true)
+    }
+
     fn semantic_context_matches(&self, context_token: &Arc<()>) -> Result<bool> {
         let guard = self
             .semantic

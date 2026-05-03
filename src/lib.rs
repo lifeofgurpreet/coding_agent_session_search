@@ -15633,13 +15633,39 @@ fn run_cli_search(
         }
     }
 
-    let approximate =
-        if semantic_opts.approximate && matches!(mode_meta.realized, SearchMode::Lexical) {
+    // Auto-derive `approximate=true` when HNSW is published and ready in
+    // the semantic manifest, the mode is semantic/hybrid, and the user
+    // didn't explicitly opt out via CASS_DISABLE_AUTO_APPROXIMATE=1.
+    // Without this, `--approximate` is opt-in and the published HNSW
+    // accelerator is dead weight: queries fall to brute-force linear scan
+    // over the full vector index (multi-second on the production corpus).
+    let approximate = {
+        let user_flag = semantic_opts.approximate;
+        if user_flag && matches!(mode_meta.realized, SearchMode::Lexical) {
             eprintln!("Warning: --approximate has no effect in lexical mode.");
             false
+        } else if user_flag {
+            true
+        } else if matches!(
+            mode_meta.realized,
+            SearchMode::Semantic | SearchMode::Hybrid
+        ) && std::env::var("CASS_DISABLE_AUTO_APPROXIMATE").as_deref() != Ok("1")
+        {
+            let manifest_says_ready =
+                crate::search::semantic_manifest::SemanticManifest::load_or_default(&data_dir)
+                    .ok()
+                    .and_then(|m| m.hnsw)
+                    .is_some_and(|h| h.ready);
+            if manifest_says_ready {
+                tracing::debug!(
+                    "auto-enabling approximate semantic search (HNSW ready per manifest)"
+                );
+            }
+            manifest_says_ready
         } else {
-            semantic_opts.approximate
-        };
+            false
+        }
+    };
 
     // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
     let sparse_threshold = 3; // Threshold for triggering wildcard fallback
