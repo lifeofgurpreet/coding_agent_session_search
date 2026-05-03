@@ -155,6 +155,55 @@ fn cleanup_bound_socket(public_path: &Path, bind_path: &Path) {
     }
 }
 
+/// Lock the entire process address space in physical RAM via `mlockall(2)`.
+///
+/// `MCL_CURRENT | MCL_FUTURE` covers every page currently mapped (heap,
+/// stack, mmap'd files, model weights, HNSW, FSVI) plus every future
+/// allocation as it happens. After a successful call, no daemon page can
+/// ever be swapped out, so subsequent `pread64`s stop hitting
+/// `__alloc_pages_slowpath` → memory compaction → cross-CPU TLB-flush IPIs
+/// under host memory pressure (the failure mode that produced 90-second
+/// cold-query stalls on the live VPS, perf record 2026-05-04).
+///
+/// Failure modes:
+/// - `EPERM` if `RLIMIT_MEMLOCK` is too small. The systemd unit sets
+///   `LimitMEMLOCK=18G`, but it is silently capped by the user manager's
+///   own rlimit when running as a user service. See
+///   `/etc/systemd/system/user@1001.service.d/memlock.conf`.
+/// - `ENOMEM` if locking the current set would exceed the rlimit.
+///
+/// Both failures are logged at WARN and the daemon continues — without
+/// the lock, the slow-allocator path can re-engage under pressure.
+#[cfg(target_os = "linux")]
+fn apply_mlockall() {
+    // Inline POSIX FFI — avoid pulling a `libc` dep just for mlockall.
+    const MCL_CURRENT: i32 = 1;
+    const MCL_FUTURE: i32 = 2;
+    unsafe extern "C" {
+        fn mlockall(flags: i32) -> i32;
+    }
+    let started = std::time::Instant::now();
+    // SAFETY: `mlockall` takes a scalar flag and returns a scalar. No
+    // pointers crossing the FFI boundary; thread-safe per POSIX.
+    let rc = unsafe { mlockall(MCL_CURRENT | MCL_FUTURE) };
+    if rc == 0 {
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        info!(
+            elapsed_ms,
+            "process address space locked via mlockall(MCL_CURRENT|MCL_FUTURE)"
+        );
+    } else {
+        let err = std::io::Error::last_os_error();
+        warn!(
+            error = %err,
+            errno = err.raw_os_error().unwrap_or(-1),
+            "mlockall failed; daemon pages may be reclaimed under host pressure \
+             (raise LimitMEMLOCK in the systemd unit; for user services, also \
+             raise the user manager's rlimit via /etc/systemd/system/user@<uid>.service.d/)"
+        );
+    }
+}
+
 /// Configuration for the daemon server.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -395,6 +444,23 @@ impl ModelDaemon {
             max_connections = self.config.max_connections,
             "Daemon listening"
         );
+
+        // Lock the entire process address space in physical RAM if requested.
+        // Combined with file-level mlock in warm_search.rs (which covers the
+        // FSVI + HNSW sidecars by their mmap), this stops the kernel from
+        // ever swapping any daemon page out — which is what was producing
+        // 90 s `pread64` stalls on the live VPS through the
+        // `__alloc_pages_slowpath` → `migrate_pages` → `flush_tlb_multi`
+        // chain (perf record 2026-05-04). The cost is RAM permanence: the
+        // daemon's working set (~16 GiB on the production corpus) is
+        // permanently resident. MCL_FUTURE keeps growth locked too, so
+        // model warm-up and lazy HNSW bind allocations also stay pinned.
+        // Requires the systemd unit's LimitMEMLOCK to cover the working
+        // set + headroom (configured to 18 GiB).
+        #[cfg(target_os = "linux")]
+        if std::env::var("CASS_DAEMON_MLOCKALL").as_deref() == Ok("1") {
+            apply_mlockall();
+        }
 
         // Pre-warm models if available
         info!("Pre-warming models...");
