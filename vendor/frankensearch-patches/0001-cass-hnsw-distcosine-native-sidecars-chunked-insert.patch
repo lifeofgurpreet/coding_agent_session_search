@@ -1,0 +1,298 @@
+From f17ca138afc195b001192a47c0ff987447d971b0 Mon Sep 17 00:00:00 2001
+From: Gurpreet <lifeofgurpreet@users.noreply.github.com>
+Date: Fri, 1 May 2026 23:53:19 +0200
+Subject: [PATCH] wip: carried CASS HNSW patches (DistCosine + native sidecars
+ + chunked insert)
+
+Carried patches against frankensearch HEAD 10383e3d, applied on the live VPS
+to make CASS HNSW build path safe. Documented in cass docs/CASS_HNSW_RECOVERY_2026_05_01.md.
+Preserved before relocation from /tmp to ~/src/.
+---
+ crates/frankensearch-index/src/hnsw.rs     | 137 +++++++++++++++++++--
+ crates/frankensearch-index/src/lib.rs      |   4 +-
+ crates/frankensearch-index/src/two_tier.rs |   1 +
+ 3 files changed, 127 insertions(+), 15 deletions(-)
+
+diff --git a/crates/frankensearch-index/src/hnsw.rs b/crates/frankensearch-index/src/hnsw.rs
+index 08c2aab..f6a2b74 100644
+--- a/crates/frankensearch-index/src/hnsw.rs
++++ b/crates/frankensearch-index/src/hnsw.rs
+@@ -4,14 +4,15 @@
+ //!
+ //! # Persistence
+ //!
+-//! Persistence stores metadata and row-ordered vectors in one sidecar file
+-//! (e.g. `vector.fast.hnsw`), then rebuilds the ANN graph on load.
++//! Persistence stores frankensearch metadata plus the native `hnsw_rs` graph
++//! dump. Older metadata-only sidecars are still supported and rebuild the graph
++//! from the source `VectorIndex` on load.
+ 
+ use std::path::Path;
+ use std::time::Instant;
+ 
+ use frankensearch_core::{SearchError, SearchResult, VectorHit};
+-use hnsw_rs::prelude::{DistDot, Hnsw};
++use hnsw_rs::prelude::{AnnT, DistCosine, Hnsw, HnswIo, ReloadOptions};
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::VectorIndex;
+@@ -24,6 +25,12 @@ pub const HNSW_DEFAULT_EF_CONSTRUCTION: usize = 200;
+ pub const HNSW_DEFAULT_EF_SEARCH: usize = 100;
+ /// Default HNSW max layer depth.
+ pub const HNSW_DEFAULT_MAX_LAYER: usize = 16;
++/// Default number of vectors submitted to one `hnsw_rs::parallel_insert` call.
++///
++/// `hnsw_rs` documents repeated parallel inserts as supported. Keeping batches
++/// bounded avoids one huge parallel insertion epoch holding the whole build
++/// hostage if worker threads park behind internal graph locks.
++pub const HNSW_DEFAULT_INSERT_BATCH_SIZE: usize = 4096;
+ const DIST_DOT_SHRINK: f32 = 0.999_999;
+ 
+ /// ANN construction/runtime parameters.
+@@ -37,6 +44,9 @@ pub struct HnswConfig {
+     pub ef_search: usize,
+     /// Maximum HNSW layer depth.
+     pub max_layer: usize,
++    /// Number of vectors to pass to each parallel insertion batch.
++    #[serde(default = "default_hnsw_insert_batch_size")]
++    pub insert_batch_size: usize,
+ }
+ 
+ impl Default for HnswConfig {
+@@ -46,16 +56,23 @@ impl Default for HnswConfig {
+             ef_construction: HNSW_DEFAULT_EF_CONSTRUCTION,
+             ef_search: HNSW_DEFAULT_EF_SEARCH,
+             max_layer: HNSW_DEFAULT_MAX_LAYER,
++            insert_batch_size: HNSW_DEFAULT_INSERT_BATCH_SIZE,
+         }
+     }
+ }
+ 
++const fn default_hnsw_insert_batch_size() -> usize {
++    HNSW_DEFAULT_INSERT_BATCH_SIZE
++}
++
+ /// On-disk metadata for the HNSW index.
+ #[derive(Debug, Serialize, Deserialize)]
+ struct HnswMeta {
+     doc_ids: Vec<String>,
+     config: HnswConfig,
+     dimension: usize,
++    #[serde(default)]
++    hnsw_rs_basename: Option<String>,
+ }
+ 
+ /// Diagnostics for one ANN query.
+@@ -81,7 +98,7 @@ pub struct AnnSearchStats {
+ 
+ /// HNSW ANN index over vectors aligned to `VectorIndex` row order.
+ pub struct HnswIndex {
+-    hnsw: Hnsw<'static, f32, DistDot>,
++    hnsw: Hnsw<'static, f32, DistCosine>,
+     doc_ids: Vec<String>,
+     dimension: usize,
+     config: HnswConfig,
+@@ -120,11 +137,11 @@ impl HnswIndex {
+         Self::build_from_parts(doc_ids, vectors, dimension, config)
+     }
+ 
+-    /// Load an ANN index from disk, rebuilding the graph using vectors from `source_index`.
++    /// Load an ANN index from disk.
+     ///
+-    /// The persistent `.hnsw` file only contains metadata and `doc_ids`. The actual
+-    /// vector data is read from the provided `VectorIndex` to save disk space and
+-    /// ensure consistency.
++    /// Newer sidecars load the persisted native `hnsw_rs` graph. Older sidecars
++    /// only contain metadata and `doc_ids`; those are rebuilt from
++    /// `source_index` for backward compatibility.
+     ///
+     /// # Errors
+     ///
+@@ -146,7 +163,38 @@ impl HnswIndex {
+             ));
+         }
+ 
+-        // Rehydrate vectors from source index
++        if let Some(basename) = meta.hnsw_rs_basename.as_deref() {
++            let parent = path
++                .parent()
++                .filter(|dir| !dir.as_os_str().is_empty())
++                .unwrap_or_else(|| Path::new("."));
++            if hnsw_rs_dump_files_present(parent, basename) {
++                // hnsw_rs ties the graph lifetime to the reloader even when the
++                // non-mmap load path owns the data. Keep the tiny reloader alive
++                // for the duration of this process.
++                let reloader: &'static mut HnswIo =
++                    Box::leak(Box::new(HnswIo::new(parent, basename)));
++                reloader.set_options(ReloadOptions::default().set_mmap(true));
++                let hnsw = reloader
++                    .load_hnsw::<f32, DistCosine>()
++                    .map_err(|e| ann_corrupted(path, format!("failed to load HNSW graph: {e}")))?;
++                let ann = Self {
++                    hnsw,
++                    doc_ids: meta.doc_ids,
++                    dimension: meta.dimension,
++                    config: meta.config,
++                };
++                if !ann.matches_vector_index(source_index)? {
++                    return Err(ann_corrupted(
++                        path,
++                        "persisted HNSW graph does not match source vector index",
++                    ));
++                }
++                return Ok(ann);
++            }
++        }
++
++        // Rehydrate legacy metadata-only sidecars from source vectors.
+         let mut vectors = Vec::with_capacity(meta.doc_ids.len());
+         for doc_id in &meta.doc_ids {
+             let idx = source_index.find_index_by_doc_id(doc_id)?.ok_or_else(|| {
+@@ -158,9 +206,10 @@ impl HnswIndex {
+         Self::build_from_parts(meta.doc_ids, vectors, meta.dimension, meta.config)
+     }
+ 
+-    /// Persist ANN index metadata to disk.
++    /// Persist ANN index metadata and native graph dump to disk.
+     ///
+-    /// Writes `doc_ids` and config. Does NOT write vectors (they are stored in `VectorIndex`).
++    /// Writes `doc_ids`, config, and the `hnsw_rs` graph/data files required to
++    /// load without rebuilding from the `VectorIndex`.
+     ///
+     /// # Errors
+     ///
+@@ -172,10 +221,17 @@ impl HnswIndex {
+             .unwrap_or_else(|| Path::new("."));
+         std::fs::create_dir_all(parent)?;
+ 
++        let requested_basename = hnsw_rs_basename_for(path);
++        let hnsw_rs_basename = self
++            .hnsw
++            .file_dump(parent, &requested_basename)
++            .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?;
++
+         let meta = HnswMeta {
+             doc_ids: self.doc_ids.clone(),
+             config: self.config,
+             dimension: self.dimension,
++            hnsw_rs_basename: Some(hnsw_rs_basename),
+         };
+         let metadata_bytes = serde_json::to_vec(&meta)
+             .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?;
+@@ -382,7 +438,7 @@ impl HnswIndex {
+             doc_ids.len().max(1),
+             config.max_layer,
+             config.ef_construction,
+-            DistDot,
++            DistCosine,
+         );
+         if !normalized_vectors.is_empty() {
+             let vectors_with_ids: Vec<(&Vec<f32>, usize)> = normalized_vectors
+@@ -390,7 +446,30 @@ impl HnswIndex {
+                 .enumerate()
+                 .map(|(index, vector)| (vector, index))
+                 .collect();
+-            hnsw.parallel_insert(&vectors_with_ids);
++            let insert_batch_size = config.insert_batch_size.max(1);
++            tracing::info!(
++                "building hnsw graph: points={} batch_size={} m={} ef_construction={}",
++                vectors_with_ids.len(),
++                insert_batch_size,
++                config.m,
++                config.ef_construction
++            );
++            for (batch_index, batch) in vectors_with_ids.chunks(insert_batch_size).enumerate() {
++                hnsw.parallel_insert(batch);
++                if batch_index == 0 || (batch_index + 1).is_multiple_of(25) {
++                    let inserted =
++                        ((batch_index + 1) * insert_batch_size).min(vectors_with_ids.len());
++                    tracing::info!(
++                        "hnsw graph insertion progress: inserted={}/{}",
++                        inserted,
++                        vectors_with_ids.len()
++                    );
++                }
++            }
++            tracing::info!(
++                "hnsw graph insertion complete: points={}",
++                vectors_with_ids.len()
++            );
+         }
+ 
+         Ok(Self {
+@@ -449,6 +528,20 @@ fn ann_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
+     }
+ }
+ 
++fn hnsw_rs_basename_for(path: &Path) -> String {
++    let stem = path
++        .file_stem()
++        .and_then(|value| value.to_str())
++        .filter(|value| !value.is_empty())
++        .unwrap_or("ann");
++    format!("{stem}.hnsw-rs")
++}
++
++fn hnsw_rs_dump_files_present(parent: &Path, basename: &str) -> bool {
++    parent.join(format!("{basename}.hnsw.graph")).is_file()
++        && parent.join(format!("{basename}.hnsw.data")).is_file()
++}
++
+ fn normalize_for_dist_dot(mut vector: Vec<f32>) -> Vec<f32> {
+     let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+     if norm > 0.0 {
+@@ -1074,6 +1167,24 @@ mod tests {
+         assert!((exact[0].score - approx[0].score).abs() < 1e-3);
+     }
+ 
++    #[test]
++    fn negative_pairwise_dot_products_do_not_panic() {
++        let fsvi_path = temp_path("negative-dot", "fsvi");
++        let vectors = vec![
++            vec![1.0, 0.0, 0.0, 0.0],
++            vec![-1.0, 0.0, 0.0, 0.0],
++            vec![0.0, 1.0, 0.0, 0.0],
++            vec![0.0, -1.0, 0.0, 0.0],
++        ];
++        let index = write_index(&fsvi_path, &vectors).expect("index");
++        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
++
++        let hits = ann
++            .knn_search(&vectors[0], 2, HNSW_DEFAULT_EF_SEARCH)
++            .expect("search");
++        assert_eq!(hits[0].doc_id, "doc-0000");
++    }
++
+     #[test]
+     fn persistence_round_trip() {
+         let fsvi_path = temp_path("persist", "fsvi");
+diff --git a/crates/frankensearch-index/src/lib.rs b/crates/frankensearch-index/src/lib.rs
+index 715b17d..ed98657 100644
+--- a/crates/frankensearch-index/src/lib.rs
++++ b/crates/frankensearch-index/src/lib.rs
+@@ -68,8 +68,8 @@ use tracing::debug;
+ 
+ #[cfg(feature = "ann")]
+ pub use hnsw::{
+-    AnnSearchStats, HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_DEFAULT_EF_SEARCH, HNSW_DEFAULT_M,
+-    HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex,
++    AnnSearchStats, HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_DEFAULT_EF_SEARCH,
++    HNSW_DEFAULT_INSERT_BATCH_SIZE, HNSW_DEFAULT_M, HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex,
+ };
+ pub use in_memory::{InMemoryTwoTierIndex, InMemoryVectorIndex};
+ pub use mrl::{MrlConfig, MrlSearchStats};
+diff --git a/crates/frankensearch-index/src/two_tier.rs b/crates/frankensearch-index/src/two_tier.rs
+index 55a79fc..eb341f3 100644
+--- a/crates/frankensearch-index/src/two_tier.rs
++++ b/crates/frankensearch-index/src/two_tier.rs
+@@ -791,6 +791,7 @@ fn maybe_load_or_build_ann(
+         ef_construction: config.hnsw_ef_construction,
+         ef_search: config.hnsw_ef_search,
+         max_layer: HNSW_DEFAULT_MAX_LAYER,
++        ..HnswConfig::default()
+     };
+ 
+     if ann_path.exists() {
+-- 
+2.51.2
+
