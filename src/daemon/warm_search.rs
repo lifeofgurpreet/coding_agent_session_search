@@ -21,9 +21,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
 
 use crate::daemon::protocol::{SearchRequest, SearchResponseWire};
@@ -332,6 +334,38 @@ fn open_warm_client(
                 )
             })?;
 
+        // Pin the FSVI + HNSW sidecar files into physical RAM with mlock so
+        // the kernel can't reclaim them under memory pressure from sibling
+        // processes (other agents, antivirus scans, backups). Without this,
+        // an idle daemon's vector_index pages get evicted within minutes
+        // and the next user query pays a 15-55 s page-in cost. Requires
+        // sufficient RLIMIT_MEMLOCK (set LimitMEMLOCK in the systemd unit).
+        // CASS_DAEMON_MLOCK_INDEX=0 disables; default is best-effort
+        // enabled — failures (small rlimit, missing files) are warned and
+        // the daemon continues without locking.
+        let mlock_enabled =
+            std::env::var("CASS_DAEMON_MLOCK_INDEX").as_deref() != Ok("0");
+        if mlock_enabled {
+            match mlock_vector_index(data_dir, &bound_embedder_id) {
+                Ok(bytes) if bytes > 0 => {
+                    tracing::info!(
+                        bytes_locked = bytes,
+                        embedder = %bound_embedder_id,
+                        "vector_index files pinned in RAM via mlock",
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        embedder = %bound_embedder_id,
+                        error = %err,
+                        "mlock of vector_index failed; pages may be reclaimed \
+                         under pressure (raise LimitMEMLOCK in the systemd unit)",
+                    );
+                }
+            }
+        }
+
         // Eagerly load the HNSW accelerator at warm time so the first user
         // approximate-semantic query doesn't pay the multi-second
         // `reload_hnsw` cost (~15-55 s on the production corpus, dominated
@@ -383,6 +417,82 @@ fn open_warm_client(
     }
 
     Ok((client, bound_embedder_id))
+}
+
+/// Process-lifetime holder for mlocked vector_index Mmaps. Storing the
+/// `Mmap`s here ensures the kernel keeps the underlying pages resident
+/// until daemon exit — dropping the `Mmap` would munmap and implicitly
+/// munlock. The `OnceLock` is initialized on the first warm bind; later
+/// binds re-enter and add new mappings if a different embedder_id binds
+/// (rare in practice — usually one tier per daemon instance).
+///
+/// Note: there is no public API to release these. The expectation is that
+/// the daemon process exits to release them, the same lifecycle as the
+/// SearchClient itself.
+static MLOCKED_INDEX_FILES: OnceLock<Mutex<Vec<Mmap>>> = OnceLock::new();
+
+/// Open, mmap, and `mlock(2)` the FSVI + HNSW sidecar files for `embedder_id`
+/// under `data_dir`. Returns the total bytes locked across all files. Skips
+/// silently for files that do not exist (missing HNSW = no accelerator
+/// built yet, which is fine).
+fn mlock_vector_index(data_dir: &Path, embedder_id: &str) -> Result<u64> {
+    let vi = data_dir.join(VECTOR_INDEX_DIR);
+    let candidates = [
+        vi.join(format!("index-{embedder_id}.fsvi")),
+        vi.join(format!("hnsw-{embedder_id}.chsw")),
+        vi.join(format!("hnsw-{embedder_id}.hnsw-rs.hnsw.data")),
+        vi.join(format!("hnsw-{embedder_id}.hnsw-rs.hnsw.graph")),
+    ];
+
+    let holder = MLOCKED_INDEX_FILES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut locked = holder.lock();
+    let already_locked: std::collections::HashSet<*const u8> =
+        locked.iter().map(|m| m.as_ptr()).collect();
+
+    let mut total: u64 = 0;
+    for path in &candidates {
+        if !path.is_file() {
+            continue;
+        }
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("mlock: open {}", path.display()))?;
+        // SAFETY: read-only mapping of a regular file. We hold the Mmap
+        // for the lifetime of the daemon process, so the lifetime
+        // requirements of `Mmap` (no concurrent writes that change the
+        // file size) match how cass treats these artifacts: rebuilds
+        // produce *new* paths via `.staging-…fsvi` + atomic rename, so
+        // the inode under our mapping never has its size mutated.
+        let mmap = unsafe { Mmap::map(&file) }
+            .with_context(|| format!("mlock: mmap {}", path.display()))?;
+        // Skip if we already have this region locked (idempotent re-bind).
+        if already_locked.contains(&mmap.as_ptr()) {
+            continue;
+        }
+        let len = mmap.len();
+        // SAFETY: `mmap.as_ptr()` is the start of a valid mapping of `len`
+        // bytes that we own. mlock is read-only-safe.
+        let rc = unsafe {
+            libc::mlock(mmap.as_ptr() as *const libc::c_void, len as libc::size_t)
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!(
+                "mlock({}): {} ({}). Bytes already locked this call: {}.",
+                path.display(),
+                err,
+                err.raw_os_error().unwrap_or(-1),
+                total
+            );
+        }
+        total = total.saturating_add(len as u64);
+        locked.push(mmap);
+        tracing::debug!(
+            file = %path.display(),
+            bytes = len,
+            "mlock successful",
+        );
+    }
+    Ok(total)
 }
 
 /// Execute a search using the given warm entry. Mirrors the dispatch logic

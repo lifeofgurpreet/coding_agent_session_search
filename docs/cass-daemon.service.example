@@ -1,0 +1,114 @@
+# systemd user unit for the cass warm-search daemon.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp this-file ~/.config/systemd/user/cass-daemon.service
+#   loginctl enable-linger $USER          # keep running across logouts
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now cass-daemon
+#
+# Logs:
+#   journalctl --user -u cass-daemon -f
+
+[Unit]
+Description=cass warm search daemon (resident SearchClient + HNSW)
+After=network.target
+
+[Service]
+Type=simple
+
+# Memory cap. Empirically the warm daemon's working set on this corpus is
+# ~22 GB (Tantivy reader + FSVI + HNSW graph + SQLite + query scratch). We
+# set the soft self-shutdown limit at 28 GB so the daemon has comfortable
+# headroom for query bursts without nuking itself, and let the cgroup hard
+# cap (MemoryMax below) bound the worst case so it never OOMs the host.
+Environment=CASS_DAEMON_MEMORY_LIMIT=28000000000
+
+# Idle shutdown after 6 hours of no activity. Set to 0 to keep resident
+# forever (recommended on a dedicated host).
+Environment=CASS_DAEMON_IDLE_TIMEOUT_SECS=21600
+
+# Connection cap. 16 is the default; warm search is fast enough that you
+# rarely need more.
+Environment=CASS_DAEMON_MAX_CONNECTIONS=16
+
+# Niceness. 10 keeps the daemon out of the way of interactive work; the
+# in-process fallback path uses no nice at all so a desperate caller can
+# always still get a fresh search.
+Environment=CASS_DAEMON_NICE=10
+
+# Phase 1 profiling on wk08 (2026-05-02) found glibc malloc dominated the
+# warm-semantic CPU budget. We swept eight allocator configurations on a
+# warm daemon serving 12-15 hash-semantic queries each, post-pre-warm:
+#
+#   variant                            p50      p99    cold-load   RSS
+#   ---------------------------------- -----    ----   ---------   ------
+#   glibc default                      26.5s   38.2s     82s        ~14GB
+#   MALLOC_ARENA_MAX=1                 17.5s   21.4s     84s        14.0GB
+#   MALLOC_ARENA_MAX=2                 15.0s   20.8s     59s        ~14GB
+#   MALLOC_ARENA_MAX=2 + TRIM=-1       18.1s   41.3s     44s        19.6GB
+#   jemalloc                           22.4s   30.6s     47s        ~14GB
+#   mimalloc                           20.6s   28.1s     33s         7.9GB
+#   tcmalloc (full)                    11.4s   13.0s     35s        17.3GB
+#   tcmalloc-minimal                    9.0s   10.3s     37s        17.4GB    <-- chosen
+#
+# tcmalloc-minimal is 2.93x faster than glibc on p50 and has the tightest
+# tail (p99/p50 = 1.14, vs glibc's 1.44). The remaining 9s p50 lives in
+# fsqlite's per-row execution machinery (SqliteValue::ConvertVec::to_vec
+# at 4.54%, VDBE column reads at 2.99%, drops at ~2.2%, smallvec
+# conversions, page cache evictions, etc., totaling ~22% CPU per
+# symbolicated profile in docs/CASS_HNSW_RECOVERY_2026_05_01.md).
+# Reducing that further requires CASS-side changes — caching hydrated
+# SearchHits in the warm daemon and/or narrowing the hydration SQL to
+# match field_mask. Phase 3 work.
+Environment=LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4
+
+# Phase 2 (2026-05-02): pre-bind the warm SearchClient at daemon startup
+# so the first user query doesn't pay the 30-90s lazy FSVI/HNSW load.
+# Symmetric with the existing model pre-warm step. Code in
+# src/daemon/core.rs.
+Environment=CASS_DAEMON_PREWARM_SEARCH=1
+
+# Phase 4 (2026-05-03): pin the FSVI + HNSW sidecar files in physical RAM
+# with mlock(2) so the kernel can't reclaim them under memory pressure
+# from sibling processes (other agents, antivirus scans, backups). Without
+# the lock, an idle daemon's vector_index pages get evicted within minutes
+# and the next user query pays a 15-55s page-in cost — measured directly
+# on this VPS during the 2026-05-03 session. ~2.5 GB on the production
+# corpus, well below LimitMEMLOCK below.
+#
+# Set CASS_DAEMON_MLOCK_INDEX=0 to opt out (e.g. on a memory-tight host).
+Environment=CASS_DAEMON_MLOCK_INDEX=1
+
+# Eagerly load the HNSW accelerator at warm time so the first user
+# --approximate query doesn't pay the multi-second lazy reload cost.
+# Disable by setting CASS_DAEMON_PREWARM_ANN=0.
+Environment=CASS_DAEMON_PREWARM_ANN=1
+
+# Allow mlock of up to 4 GiB. The mlocked working set on the production
+# corpus is ~2.5 GiB (FSVI ~750 MB + HNSW data 1.3 GB + HNSW graph 350 MB
+# + chsw 90 MB); 4 GiB leaves headroom for a tier swap or growth without
+# raising this again.
+LimitMEMLOCK=4G
+
+ExecStart=%h/.local/bin/cass.real daemon --idle-timeout 21600
+
+# Hard kill if the daemon doesn't come down on SIGTERM in 30s.
+TimeoutStopSec=30
+
+# Restart on failure but cap the loop so a permanently-broken binary
+# doesn't busywake the host.
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# Resource hardening. The cgroup hard cap is the floor of trust: even if
+# the daemon's self-shutdown logic above is broken, the kernel will refuse
+# to let it grow past 32 GB on a 47 GB host.
+MemoryMax=32G
+CPUQuota=400%
+TasksMax=512
+
+[Install]
+WantedBy=default.target

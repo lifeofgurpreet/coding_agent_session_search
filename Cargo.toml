@@ -79,6 +79,7 @@ unicode-normalization = "0.1.25"
 urlencoding = "2.1.3"
 half = { version = "2.7.1", features = ["bytemuck"] }
 memmap2 = "0.9.10"
+libc = "0.2.186"  # raw mlock for daemon-side pinning of vector_index mmaps
 bytemuck = "1.25.0"
 fastembed = { version = "5.13.4", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
 frankensearch = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "831b3b13", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
