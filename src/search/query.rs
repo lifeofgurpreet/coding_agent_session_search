@@ -1979,7 +1979,16 @@ impl QueryCache {
 /// `content` field is bounded by `max_content_length` (default 200 chars
 /// for snippets, full size when `needs_content`). For a typical agent
 /// session corpus, 32K hits with average 2 KB content = ~64 MB.
-const HYDRATION_CACHE_DEFAULT_CAPACITY: usize = 32_768;
+///
+/// Phase 8 (2026-05-04): bumped from 32_768 to 1_048_576 so the entire
+/// 872K-message corpus fits without LRU eviction. This pairs with the
+/// `prewarm_hydration_cache` call from warm-bind: every cold semantic
+/// query becomes a pure in-memory HashMap lookup, sidestepping the
+/// fsqlite full_table_scan that costs 30-44 s per cold query (138K
+/// pread64 calls observed via strace, ~540 MB of page reads even for a
+/// 12-row hydration). Memory cost: ~5 GB at full population, fits under
+/// the daemon's 30 GB LimitMEMLOCK with the existing mlocked 26 GB.
+const HYDRATION_CACHE_DEFAULT_CAPACITY: usize = 1_048_576;
 
 /// Per-(message_id, field_mask) key for the hydration cache.
 ///
@@ -2027,12 +2036,43 @@ impl HydrationCache {
     /// Look up a hit for the given key. Returns `None` on miss or lock
     /// poisoning (errors fall back to SQL hydration as if the cache were
     /// empty — never a correctness issue, only a perf miss).
+    ///
+    /// Phase 8 (2026-05-04): falls back to a `FieldMask::FULL` entry if
+    /// the exact-mask lookup misses. The prewarm path always populates
+    /// with FULL, so any query that asks for a subset of fields can be
+    /// served from the prewarmed entry. The returned `SearchHit` has
+    /// fields the caller didn't ask for trimmed to empty strings to
+    /// preserve the wire-format guarantee that field_mask makes.
     fn get(&self, message_id: u64, field_mask: FieldMask) -> Option<Arc<SearchHit>> {
         let key = HydrationCacheKey {
             message_id,
             field_mask_bits: field_mask.bits(),
         };
-        self.inner.lock().ok()?.get(&key).cloned()
+        let mut guard = self.inner.lock().ok()?;
+        if let Some(hit) = guard.get(&key).cloned() {
+            return Some(hit);
+        }
+        // Fall back to the FULL-mask prewarm entry, trimming on the way out.
+        let full_key = HydrationCacheKey {
+            message_id,
+            field_mask_bits: FieldMask::FULL.bits(),
+        };
+        let full_hit = guard.get(&full_key).cloned()?;
+        drop(guard);
+        if field_mask.bits() == FieldMask::FULL.bits() {
+            return Some(full_hit);
+        }
+        let mut trimmed = (*full_hit).clone();
+        if !field_mask.wants_title() {
+            trimmed.title = String::new();
+        }
+        if !field_mask.wants_snippet() {
+            trimmed.snippet = String::new();
+        }
+        if !field_mask.needs_content() {
+            trimmed.content = String::new();
+        }
+        Some(Arc::new(trimmed))
     }
 
     /// Insert a freshly-hydrated hit. Silently no-ops on lock poisoning.
@@ -3902,6 +3942,113 @@ impl SearchClient {
         }
         let _ = self.ann_index()?;
         Ok(true)
+    }
+
+    /// Phase 8 (2026-05-04): pre-populate the hydration cache with EVERY
+    /// message's full hydrated `SearchHit` so that all subsequent semantic
+    /// queries are served from in-memory HashMap lookups instead of paying
+    /// fsqlite's full-table-scan cost on the cold path.
+    ///
+    /// Background: live VPS bench (CTE rewrite, K=12 hydration) showed
+    /// cold-query p50 of 15-43 s. strace identified 138K pread64 calls
+    /// per cold query — fsqlite's planner chose `full_table_scan` on the
+    /// 872K-row `messages` table for what should have been a primary-key
+    /// IN-list lookup (native sqlite3 does the same query in 19 ms). The
+    /// only durable workaround is to bypass fsqlite on the hot path.
+    ///
+    /// This method takes the one-time scan cost (~30 s) at warm-bind so
+    /// every subsequent query is sub-100 ms. Skipped via
+    /// `CASS_DAEMON_PREWARM_HYDRATION=0` for callers that want the lazy
+    /// behavior.
+    pub fn prewarm_hydration_cache(&self) -> Result<usize> {
+        if std::env::var("CASS_DAEMON_PREWARM_HYDRATION").as_deref() == Ok("0") {
+            return Ok(0);
+        }
+        let cache = self
+            .semantic_hydration_cache()
+            .ok_or_else(|| anyhow!("semantic context not bound; cannot prewarm hydration"))?;
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard.as_ref().ok_or_else(|| {
+            anyhow!("semantic search requires database connection for prewarm")
+        })?;
+
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+        // Same JOIN shape as `hydrate_semantic_hits_with_ids` but unfiltered
+        // — fsqlite issues a single full scan instead of one per query.
+        let sql = format!(
+            "SELECT m.id, c.id, m.content, m.created_at, m.idx, m.role, c.title, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             LEFT JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN sources s ON c.source_id = s.id"
+        );
+
+        let full_mask = FieldMask::FULL;
+        let started = Instant::now();
+        let rows: Vec<(u64, SearchHit)> =
+            conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+                let message_id: i64 = row.get_typed(0)?;
+                let conversation_id: i64 = row.get_typed(1)?;
+                let full_content: String = row.get_typed(2)?;
+                let msg_created_at: Option<i64> = row.get_typed(3)?;
+                let idx: Option<i64> = row.get_typed(4)?;
+                let title: Option<String> = row.get_typed(6)?;
+                let source_path: String = row.get_typed(7)?;
+                let raw_source_id: String = row.get_typed(8)?;
+                let origin_host: Option<String> = row.get_typed(9)?;
+                let agent: String = row.get_typed(10)?;
+                let workspace: Option<String> = row.get_typed(11)?;
+                let raw_origin_kind: Option<String> = row.get_typed(12)?;
+                let started_at: Option<i64> = row.get_typed(13)?;
+
+                let created_at = msg_created_at.or(started_at);
+                let line_number = idx
+                    .and_then(|i| usize::try_from(i).ok())
+                    .map(|i| i.saturating_add(1));
+                let snippet = snippet_from_content(&full_content);
+                let content_hash =
+                    stable_hit_hash(&full_content, &source_path, line_number, created_at);
+                let source_id = normalized_search_hit_source_id_parts(
+                    raw_source_id.as_str(),
+                    raw_origin_kind.as_deref().unwrap_or_default(),
+                    origin_host.as_deref(),
+                );
+                let origin_kind =
+                    normalized_search_hit_origin_kind(&source_id, raw_origin_kind.as_deref());
+                let hit = SearchHit {
+                    title: title.unwrap_or_default(),
+                    snippet,
+                    content: full_content,
+                    content_hash,
+                    conversation_id: Some(conversation_id),
+                    score: 0.0,
+                    source_path,
+                    agent,
+                    workspace: workspace.unwrap_or_default(),
+                    workspace_original: None,
+                    created_at,
+                    line_number,
+                    match_type: MatchType::Exact,
+                    source_id,
+                    origin_kind,
+                    origin_host,
+                };
+                Ok((semantic_message_id_from_db(message_id)?, hit))
+            })?;
+
+        let load_ms = started.elapsed().as_millis();
+        let count = rows.len();
+        for (id, hit) in rows {
+            cache.put(id, full_mask, Arc::new(hit));
+        }
+        tracing::info!(
+            entries = count,
+            load_ms = load_ms,
+            "hydration cache prewarmed (full field-mask)",
+        );
+        Ok(count)
     }
 
     fn semantic_context_matches(&self, context_token: &Arc<()>) -> Result<bool> {

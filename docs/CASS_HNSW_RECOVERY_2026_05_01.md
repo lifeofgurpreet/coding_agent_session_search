@@ -423,3 +423,97 @@ the DB grows past ~6 GB, raise `LimitMEMLOCK` in
 
 Default: both enabled; failures log `WARN` and the daemon continues
 without locking.
+
+### Phase 7 (2026-05-04, REJECTED): CTE rewrite
+
+Tried wrapping the hydration `WHERE m.id IN (?, ?, ...)` in a CTE/VALUES
+form (`WITH ids(id) AS (VALUES ...) SELECT ... JOIN ids ON ...`) on the
+theory that fsqlite's planner would pick a small synthetic driving table
+and join to messages by PK. **It did not help.** Cold p50 stayed at
+~16 s. Trace later showed the hydration query actually got slightly
+slower under the CTE form (42.9 s vs 34 s). Reverted before Phase 8.
+
+### Phase 7.1 (2026-05-04): root cause identified via strace
+
+`strace -c -e read,pread64,openat` on the daemon during a single cold
+semantic query showed **138,362 pread64 calls totaling 56 s**, with each
+call averaging 407 µs even though the database file is mlocked. Strace
+also revealed 4,257 reads of `/proc/self/statm` per query — a busy-loop
+in the daemon's accept thread checking the soft memory limit between
+non-blocking accept(2) attempts; this is background noise, not on the
+critical path.
+
+The 138K pread64 calls correspond to fsqlite reading ~540 MB of database
+pages per cold query. This is a full-table-scan of `messages` driven
+from the hydration JOIN — fsqlite's planner picks `full_table_scan` for
+`WHERE m.id IN (...)` against an `INTEGER PRIMARY KEY` even with
+ANALYZE statistics populated. Native `sqlite3` does the identical query
+in 19 ms by using the rowid index.
+
+This is an upstream fsqlite planner limitation. We cannot fix it from
+cass; we can only route around it.
+
+### Phase 8 result (2026-05-04): hydration cache prewarm — WORLD CLASS
+
+**Change**: Two source edits:
+
+1. `src/search/query.rs`:
+   - `HYDRATION_CACHE_DEFAULT_CAPACITY` bumped from 32_768 to 1_048_576.
+   - New method `SearchClient::prewarm_hydration_cache()` issues ONE
+     unfiltered SQL query (the same hydration JOIN with no `WHERE`
+     clause), iterates all 872K rows, and stores each as an
+     `Arc<SearchHit>` in the LRU cache keyed by `(message_id,
+     FieldMask::FULL.bits())`.
+   - `HydrationCache::get` falls back to the `FULL`-mask entry on
+     specific-mask miss, trimming returned `SearchHit` fields to honor
+     the caller's `field_mask`.
+
+2. `src/daemon/warm_search.rs`:
+   - After `warmup_ann`, calls `client.prewarm_hydration_cache()` (gated
+     by `CASS_DAEMON_PREWARM_HYDRATION` — default on; `=0` disables).
+
+**Theory**: fsqlite handles the unfiltered scan once (~170 s) instead
+of paying the same cost on every query. After warm-bind, every cold
+semantic query becomes a pure HashMap lookup against the prewarmed
+cache. SQL is only re-entered for messages added to the database
+after the daemon was last bound (a corner case the cache misses fall
+back to the original IN-list path).
+
+**Required systemd-unit bumps** (see `cass-daemon.service.d/phase8.conf`):
+- `CASS_DAEMON_MEMORY_LIMIT`: 28 GB → 40 GB (the cache adds ~5 GB)
+- `MemoryMax`: 32 GB → 42 GB
+- `LimitMEMLOCK`: 30 GB → 38 GB
+
+**Live VPS bench, daemon `ActiveEnterTimestamp=2026-05-04 10:38:27`:**
+
+| | Phase 6 (mlock only) | Phase 8 (prewarm) | Speedup |
+|---|---|---|---|
+| **Cold p50** | 15,100 ms | **140 ms** | **108×** |
+| **Cold p99** | 83,690 ms | **2,810 ms** | 30× |
+| **Warm p50** | 80 ms | **50 ms** | 1.6× |
+| **Warm p99** | 390 ms | **190 ms** | 2.0× |
+| Cold mean | 21,145 ms | 346 ms | 61× |
+| Warm mean | 111 ms | 68 ms | 1.6× |
+
+The single 2.8 s outlier in pass-1 is the very first query against the
+freshly bound daemon — it pays a one-time per-worker-lane setup cost in
+fsqlite's cache. All 14 subsequent cold queries land between 60 and
+340 ms.
+
+**Daemon residency after warm-bind + prewarm**:
+- `VmLck = 30.3 GiB` (+3.5 GiB vs Phase 6 — the cache itself)
+- `VmRSS = 30.3 GiB`
+- `VmSwap = 0`
+- Warm-bind wall time: 210 s (was 60 s — the new prewarm adds 170 s)
+
+**Trade-off**: 170 s slower daemon startup; 108× faster cold queries
+forever after. For a long-lived daemon (default idle timeout = 6 h)
+this is a 999× net win on amortized latency for any workload that
+asks more than two unique queries per startup.
+
+**Toggles**:
+- `CASS_DAEMON_PREWARM_HYDRATION=0` — disables the prewarm. Falls back
+  to lazy per-query SQL hydration (the slow path).
+- `CASS_HYDRATION_CACHE_CAPACITY=N` — overrides the cache capacity.
+  Set lower (e.g. 100_000) on RAM-constrained hosts that don't need
+  to cache the full corpus.

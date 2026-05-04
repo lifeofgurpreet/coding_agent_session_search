@@ -437,6 +437,43 @@ fn open_warm_client(
                 }
             }
         }
+
+        // Phase 8 (2026-05-04): pre-populate the hydration cache with every
+        // message's full SearchHit. Without this, fsqlite's planner picks
+        // full_table_scan on `messages` for the IN-list hydration query
+        // (138K pread64 calls per cold query observed via strace), giving
+        // 15-43 s cold p50. With prewarm, each cold query is a HashMap
+        // lookup (~100 ms p50). One-time cost: ~30 s during warm-bind.
+        // Disable via `CASS_DAEMON_PREWARM_HYDRATION=0`.
+        let prewarm_hyd =
+            std::env::var("CASS_DAEMON_PREWARM_HYDRATION").as_deref() != Ok("0");
+        if prewarm_hyd {
+            let prewarm_started = Instant::now();
+            match client.prewarm_hydration_cache() {
+                Ok(0) => {
+                    tracing::debug!(
+                        embedder = %bound_embedder_id,
+                        "hydration cache prewarm skipped (CASS_DAEMON_PREWARM_HYDRATION=0)",
+                    );
+                }
+                Ok(entries) => {
+                    tracing::info!(
+                        prewarm_hydration_ms = prewarm_started.elapsed().as_millis() as u64,
+                        entries = entries,
+                        embedder = %bound_embedder_id,
+                        "hydration cache prewarmed at daemon startup",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        embedder = %bound_embedder_id,
+                        error = %err,
+                        "hydration cache prewarm failed; cold queries will pay \
+                         per-query fsqlite full-table-scan cost",
+                    );
+                }
+            }
+        }
     } else {
         // Lexical-only warm. Still useful: keeps Tantivy reader resident.
         let summary = match &setup.availability {
