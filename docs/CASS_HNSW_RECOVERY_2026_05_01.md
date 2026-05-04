@@ -348,3 +348,78 @@ If the daemon was evicted or stopped, the wrapper still works: it
 detects the missing socket and reverts to the v1 lexical-fallback
 guard with `_cass_semantic_guard` in JSON output, so agents are never
 worse off than they were before this work.
+
+### Phase 6 result (2026-05-04): mlock the SQLite database too
+
+**Change**: `src/daemon/warm_search.rs` adds `mlock_database_file()` (called
+during warm-bind, gated by `CASS_DAEMON_MLOCK_DB`). The daemon now mmaps
+the entire `agent_search.db` file and `mlock(2)`s it so the kernel cannot
+evict its pages under sibling-process memory pressure.
+
+**Why**: Phase 5 mlocked the FSVI + HNSW sidecars but left the SQLite DB
+exposed. On the live VPS (2026-05-04), with sibling pressure from
+`clamscan -r /` and a swapped-out 26 GB swapfile, the DB page cache
+got evicted within ~5 minutes of activity. Cold queries then paid a
+30+ second disk-read cost on hydration (5+ GB DB, ~16 KiB per row,
+hundreds of rows per query at the contended ~1.4 MiB/s disk rate).
+Manually `cat`-priming the DB into page cache dropped p50 to 40 ms;
+the pages were re-evicted within 5 minutes. mlock makes that priming
+permanent.
+
+**Verified on the live VPS, daemon `ActiveEnterTimestamp=2026-05-04 05:36:10`:**
+
+```
+INFO process address space locked via mlockall(MCL_CURRENT|MCL_FUTURE) elapsed_ms=164
+INFO vector_index files pinned in RAM via mlock bytes_locked=2590397172 embedder=minilm-384
+INFO agent_search.db pinned in RAM via mlock bytes_locked=5508710400 path=/home/gurpreet/.local/share/coding-agent-search/agent_search.db
+```
+
+5.51 GB of DB plus 2.59 GB of vector_index = 8.10 GB pinned at the
+file-mlock layer; with `mlockall(MCL_CURRENT|MCL_FUTURE)` from Phase 5
+the total `VmLck` is 26.8 GiB. After daemon restart the host swap
+dropped from 26 GB used to 15 GB used and free RAM jumped from 1.9 GB
+to 11 GB. `VmSwap=0` for the daemon process — no paging.
+
+**Bench (live VPS, 15 unique queries, two passes), with `--daemon --approximate`:**
+
+| pass | n | p50 | p90 | p99 | min | max | mean |
+|---|---|---|---|---|---|---|---|
+| 1: cold (empty hydration cache) | 15 | 15.1 s | 20.8 s | 36.3 s | 12.0 s | 36.3 s | 17.0 s |
+| 2: warm hydration cache | 15 | **80 ms** | **240 ms** | **390 ms** | **40 ms** | **450 ms** | **111 ms** |
+
+Pass 2 beats wk08's 139 ms baseline (80 ms vs 139 ms). **Pass 1 cold did
+NOT improve** — same 15 s p50 as before mlock. So the cold bottleneck
+is *not* DB disk I/O (now eliminated) but something CPU-bound in the
+hydration path itself: SQLite query execution + per-row deserialization
+of K candidate rows (where K ≈ 200-500 for `--approximate --limit 3`
+recall_factor). Top of that 15 s budget on a single fresh query
+elsewhere measured `daemon.elapsed_ms = 16,738` — the CLI overhead is
+trivial; the work is in the daemon.
+
+**What mlock _did_ buy us:**
+- Sub-100 ms warm-cache hits survive sibling pressure (previously
+  evicted within minutes; now permanent).
+- `VmSwap=0` on the daemon — no paging stalls on cache evictions.
+- Host swap usage dropped 11 GB after daemon restart (the previous
+  daemon's swapped-out pages were freed when the new one mlocked
+  fresh ones).
+
+**What mlock did _not_ fix:**
+- Cold-query p50 ~ 15 s. Hydrating K candidate rows is the bottleneck.
+  Next phase: cap K, parallelize hydration, or pre-warm the hydration
+  cache for popular query patterns.
+
+**Memory budget check**: `VmLck=26.8 GiB`, `LimitMEMLOCK=30 GiB` ->
+3.2 GiB headroom. Tight but not crisis. If we add more to mlock or
+the DB grows past ~6 GB, raise `LimitMEMLOCK` in
+`~/.config/systemd/user/cass-daemon.service`.
+
+### Phase 6 toggles
+
+- `CASS_DAEMON_MLOCK_INDEX=0` — disables BOTH index and DB mlock
+  (legacy toggle, covers Phase 5's vector_index mlock too).
+- `CASS_DAEMON_MLOCK_DB=0` — disables only the DB mlock; the
+  vector_index mlock still runs.
+
+Default: both enabled; failures log `WARN` and the daemon continues
+without locking.

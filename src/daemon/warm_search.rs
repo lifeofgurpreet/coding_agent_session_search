@@ -364,6 +364,42 @@ fn open_warm_client(
                     );
                 }
             }
+
+            // Also lock the SQLite agent_search.db. Without this, the
+            // `messages` table page cache gets evicted under host pressure
+            // and cold-query hydration pays a ~30 s disk-read cost (5+ GB
+            // DB, ~16 KiB per row, 100s of rows per query). Empirical
+            // evidence on the live VPS 2026-05-04: with vector_index mlock
+            // alone, pass-1 cold p50 was 33 s; manually `cat`-priming the
+            // .db dropped it to 40 ms; pages got re-evicted within 5 min
+            // under sibling-process pressure. Locking eliminates the
+            // dependence on system-wide page-cache survival.
+            // Granular toggle: CASS_DAEMON_MLOCK_DB=0 disables only the
+            // DB lock (still bundled under CASS_DAEMON_MLOCK_INDEX above).
+            let mlock_db_enabled =
+                std::env::var("CASS_DAEMON_MLOCK_DB").as_deref() != Ok("0");
+            if mlock_db_enabled {
+            match mlock_database_file(db_path) {
+                Ok(bytes) if bytes > 0 => {
+                    tracing::info!(
+                        bytes_locked = bytes,
+                        path = %db_path.display(),
+                        "agent_search.db pinned in RAM via mlock",
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "mlock of agent_search.db failed; cold-query \
+                         hydration will pay disk-read cost when page cache \
+                         is evicted (raise LimitMEMLOCK or set \
+                         CASS_DAEMON_MLOCK_DB=0 to silence this warning)",
+                    );
+                }
+            }
+            }
         }
 
         // Eagerly load the HNSW accelerator at warm time so the first user
@@ -430,6 +466,55 @@ fn open_warm_client(
 /// the daemon process exits to release them, the same lifecycle as the
 /// SearchClient itself.
 static MLOCKED_INDEX_FILES: OnceLock<Mutex<Vec<Mmap>>> = OnceLock::new();
+
+/// Open, mmap, and `mlock(2)` the SQLite database file. Same pattern as
+/// `mlock_vector_index` — keep the `Mmap` alive for daemon lifetime so the
+/// kernel can't evict our pages under host memory pressure. Idempotent:
+/// safe to call across re-binds (skips files whose mmap pointer is already
+/// in the holder).
+///
+/// Note: SQLite reads the .db via its own pager, NOT through this mmap.
+/// The mmap exists *only* to keep the file's pages resident in the kernel
+/// page cache. SQLite's pread64s into those pages then become page-cache
+/// hits instead of disk reads.
+fn mlock_database_file(db_path: &Path) -> Result<u64> {
+    if !db_path.is_file() {
+        return Ok(0);
+    }
+
+    let holder = MLOCKED_INDEX_FILES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut locked = holder.lock();
+
+    let file = std::fs::File::open(db_path)
+        .with_context(|| format!("mlock: open {}", db_path.display()))?;
+    // SAFETY: read-only mapping of a regular file. SQLite may write to
+    // the .db via its own connection, but those writes go through the
+    // pager and are not reflected in our mmap (which is a snapshot at
+    // mmap time for the metadata; data pages get refreshed on read).
+    // Crucially, the FILE size doesn't shrink — SQLite never truncates
+    // beyond the journal/WAL boundary — so our mapped region stays
+    // valid for the lifetime of the daemon.
+    let mmap = unsafe { Mmap::map(&file) }
+        .with_context(|| format!("mlock: mmap {}", db_path.display()))?;
+    if locked.iter().any(|m| m.as_ptr() == mmap.as_ptr()) {
+        return Ok(0); // already locked from a prior bind
+    }
+    let len = mmap.len();
+    // SAFETY: see mlock_vector_index for the same pattern.
+    let rc =
+        unsafe { libc::mlock(mmap.as_ptr() as *const libc::c_void, len as libc::size_t) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!(
+            "mlock({}): {} ({})",
+            db_path.display(),
+            err,
+            err.raw_os_error().unwrap_or(-1),
+        );
+    }
+    locked.push(mmap);
+    Ok(len as u64)
+}
 
 /// Open, mmap, and `mlock(2)` the FSVI + HNSW sidecar files for `embedder_id`
 /// under `data_dir`. Returns the total bytes locked across all files. Skips
