@@ -7,11 +7,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use frankensearch::index::{
     HNSW_DEFAULT_EF_CONSTRUCTION as FS_HNSW_DEFAULT_EF_CONSTRUCTION,
-    HNSW_DEFAULT_INSERT_BATCH_SIZE as FS_HNSW_DEFAULT_INSERT_BATCH_SIZE,
     HNSW_DEFAULT_M as FS_HNSW_DEFAULT_M, HnswConfig as FsHnswConfig, HnswIndex as FsHnswIndex,
     Quantization as FsQuantization, VectorIndex as FsVectorIndex,
     VectorIndexWriter as FsVectorIndexWriter,
 };
+// Upstream frankensearch (rev 831b3b13) does not export
+// `HNSW_DEFAULT_INSERT_BATCH_SIZE` and `HnswConfig::insert_batch_size`. The
+// v0.4.2-warm-forward fork relied on a vendored frankensearch patch
+// ("chunked parallel_insert") that is filed but not landed upstream. Until
+// that patch is upstreamed, we accept the env var
+// `CASS_HNSW_INSERT_BATCH_SIZE` for operator observability but cannot
+// thread it into frankensearch's HnswConfig. See
+// `vendor/frankensearch-patches/README.md` for the forward-port plan.
 use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
@@ -1882,25 +1889,27 @@ impl SemanticIndexer {
                     .and_then(|value| value.parse::<usize>().ok())
             })
             .unwrap_or(FS_HNSW_DEFAULT_EF_CONSTRUCTION);
-        let insert_batch_size = std::env::var("CASS_HNSW_INSERT_BATCH_SIZE")
+        // CASS_HNSW_INSERT_BATCH_SIZE: read-and-logged for operator
+        // observability; frankensearch rev 831b3b13 does not yet expose a
+        // batch_size field on HnswConfig, so the value is informational
+        // only until the chunked_insert patch lands upstream.
+        let insert_batch_size_observed: Option<usize> = std::env::var("CASS_HNSW_INSERT_BATCH_SIZE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(FS_HNSW_DEFAULT_INSERT_BATCH_SIZE);
+            .filter(|value| *value > 0);
 
         tracing::info!(
             embedder = self.embedder_id(),
             count = vector_index.record_count(),
             m,
             ef_construction,
-            insert_batch_size,
+            insert_batch_size_observed = ?insert_batch_size_observed,
             "Building HNSW index for approximate nearest neighbor search"
         );
 
         let config = FsHnswConfig {
             m,
             ef_construction,
-            insert_batch_size,
             ..FsHnswConfig::default()
         };
         let hnsw = FsHnswIndex::build_from_vector_index(vector_index, config)

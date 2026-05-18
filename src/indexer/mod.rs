@@ -10626,11 +10626,17 @@ pub fn run_index(
                 &existing_vector_path,
             )
             .map_err(|err| anyhow::anyhow!("open existing semantic vector index failed: {err}"))?;
+            // opts.hnsw_m and opts.hnsw_ef_construction are not yet present
+            // on upstream `IndexOptions`; the v0.4.2-warm-forward fork added
+            // them but the equivalent upstream surface uses env vars
+            // CASS_HNSW_M / CASS_HNSW_EF_CONSTRUCTION read inside
+            // build_hnsw_index. Pass None here so the indexer falls back to
+            // env-or-default; that matches operator-facing behavior.
             let hnsw_path = semantic_indexer.build_hnsw_index(
                 &vector_index,
                 &opts.data_dir,
-                opts.hnsw_m,
-                opts.hnsw_ef_construction,
+                None,
+                None,
             )?;
             tracing::info!(
                 path = %hnsw_path.display(),

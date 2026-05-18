@@ -19439,6 +19439,11 @@ impl super::ftui_adapter::Model for CassApp {
                 #[cfg(not(test))]
                 {
                     ftui::Cmd::task(move || {
+                        // hnsw_m / hnsw_ef_construction were warm-forward
+                        // additions to IndexOptions; upstream IndexOptions
+                        // does not yet expose those fields. They are read
+                        // from CASS_HNSW_M / CASS_HNSW_EF_CONSTRUCTION at
+                        // build_hnsw_index time instead.
                         let opts = crate::indexer::IndexOptions {
                             full: false,
                             force_rebuild: false,
@@ -19448,8 +19453,6 @@ impl super::ftui_adapter::Model for CassApp {
                             data_dir,
                             semantic: false,
                             build_hnsw: false,
-                            hnsw_m: None,
-                            hnsw_ef_construction: None,
                             embedder: "fastembed".to_string(),
                             progress: Some(progress),
                             watch_interval_secs: 30,
