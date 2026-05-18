@@ -984,6 +984,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "itoa",
+ "libc",
  "lru 0.18.0",
  "memmap2",
  "mime_guess",
