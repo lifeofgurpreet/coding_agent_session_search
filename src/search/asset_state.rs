@@ -799,7 +799,10 @@ fn semantic_tier_queryable(
     availability: &SemanticAvailability,
     tier: &SemanticTierAssetState,
 ) -> bool {
-    if !tier.ready || tier.current_db_matches != Some(true) {
+    // Fast status/health probes may intentionally skip the DB fingerprint on
+    // large corpora. Treat unknown currentness as usable-but-unproven; only a
+    // proven mismatch should force lexical fallback.
+    if !tier.ready || tier.current_db_matches == Some(false) {
         return false;
     }
     let Some(embedder_id) = tier.embedder_id.as_deref() else {
