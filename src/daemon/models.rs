@@ -38,6 +38,11 @@ impl ModelManager {
         }
     }
 
+    /// Data directory backing this model manager and daemon instance.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     /// Check if any model is loaded and ready.
     pub fn is_ready(&self) -> bool {
         self.embedder.read().is_some()

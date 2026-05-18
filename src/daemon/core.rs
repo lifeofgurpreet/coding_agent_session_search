@@ -473,12 +473,12 @@ impl ModelDaemon {
         info!("Model pre-warming complete");
 
         // Pre-bind the warm SearchClient (FSVI + HNSW + Tantivy + filter maps)
-        // for the default data dir so the first user query doesn't pay the
+        // for this daemon's data dir so the first user query doesn't pay the
         // 30-90s lazy-bind cost. Phase 2 (2026-05-02) — gated by
         // CASS_DAEMON_PREWARM_SEARCH=1 so existing operators can opt in.
         if std::env::var("CASS_DAEMON_PREWARM_SEARCH").as_deref() == Ok("1") {
-            let data_dir = crate::default_data_dir();
-            let db_path = crate::default_db_path();
+            let data_dir = self.models.data_dir().to_path_buf();
+            let db_path = data_dir.join("agent_search.db");
             info!(
                 data_dir = %data_dir.display(),
                 db_path = %db_path.display(),
