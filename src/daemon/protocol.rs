@@ -98,8 +98,9 @@ pub enum Request {
 ///
 /// The wire format intentionally uses primitive/string types so the protocol
 /// stays stable across internal type refactors. `mode` is one of
-/// "lexical" | "semantic" | "hybrid". `field_mask_bits` is the raw bitfield
-/// representation of `FieldMask`.
+/// "lexical" | "semantic" | "hybrid". `field_mask_bits` carries the raw flag
+/// bits of `FieldMask`; `preview_content_chars` carries the optional
+/// v0.4.2 content-preview cap that is deliberately not encoded in those bits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
     /// Search query string (NFC normalization happens inside SearchClient).
@@ -130,6 +131,8 @@ pub struct SearchRequest {
     pub db_path: String,
     /// FieldMask bitfield (NEEDS_CONTENT, WANTS_SNIPPET, WANTS_TITLE, ALLOWS_CACHE).
     pub field_mask_bits: u32,
+    /// Optional preview limit for content fields. None means full content.
+    pub preview_content_chars: Option<usize>,
     /// Sparse threshold for wildcard fallback in lexical mode.
     pub sparse_threshold: usize,
     /// Whether the daemon should fail-open to lexical when semantic context

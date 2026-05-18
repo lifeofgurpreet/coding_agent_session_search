@@ -15175,6 +15175,7 @@ fn try_warm_daemon_search(
             data_dir: data_dir.to_string_lossy().into_owned(),
             db_path: db_path.to_string_lossy().into_owned(),
             field_mask_bits: field_mask.bits(),
+            preview_content_chars: field_mask.preview_content_limit(),
             sparse_threshold,
             hybrid_fail_open,
         };

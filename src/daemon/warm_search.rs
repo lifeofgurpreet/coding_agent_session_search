@@ -640,7 +640,8 @@ pub fn run_search_on_entry(
         filters.source_filter = SourceFilter::parse(s);
     }
 
-    let field_mask = FieldMask::from_bits(req.field_mask_bits);
+    let field_mask = FieldMask::from_bits(req.field_mask_bits)
+        .with_preview_content_limit(req.preview_content_chars);
     let sparse_threshold = req.sparse_threshold.max(1);
     let limit = req.limit;
     let offset = req.offset;
