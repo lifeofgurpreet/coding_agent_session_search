@@ -489,6 +489,46 @@ impl UdsDaemonClient {
             other => Err(unexpected_response(other)),
         }
     }
+
+    /// Run a warm-search query through the daemon. The daemon keeps the
+    /// Tantivy reader, FSVI vector index, HNSW graph, and hydration cache
+    /// resident, so this avoids the multi-second cold-load cost a one-shot
+    /// CLI would otherwise pay per query.
+    pub fn search(
+        &self,
+        request: crate::daemon::protocol::SearchRequest,
+    ) -> Result<crate::daemon::protocol::SearchResponseWire, DaemonError> {
+        let response = self.send_request(Request::Search(request))?;
+        match response {
+            Response::Search(wire) => Ok(wire),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// Ask the daemon to pre-warm its SearchClient for a given
+    /// `(data_dir, db_path)` without running a query. Useful for
+    /// post-rebuild reload from the CLI.
+    pub fn warm_search(
+        &self,
+        data_dir: &str,
+        db_path: &str,
+        model: Option<&str>,
+    ) -> Result<(String, u64, bool), DaemonError> {
+        let response = self.send_request(Request::WarmSearch {
+            data_dir: data_dir.to_string(),
+            db_path: db_path.to_string(),
+            model: model.map(|s| s.to_string()),
+        })?;
+        match response {
+            Response::SearchWarmed {
+                embedder_id,
+                warm_load_ms,
+                already_warm,
+                ..
+            } => Ok((embedder_id, warm_load_ms, already_warm)),
+            other => Err(unexpected_response(other)),
+        }
+    }
 }
 
 impl DaemonClient for UdsDaemonClient {

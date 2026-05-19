@@ -38,6 +38,13 @@ impl ModelManager {
         }
     }
 
+    /// Data directory backing this model manager and daemon instance.
+    /// Used by the warm-search pre-bind path so it can default to the
+    /// daemon's configured data dir instead of the CLI's default.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     /// Check if any model is loaded and ready.
     pub fn is_ready(&self) -> bool {
         self.embedder.read().is_some()

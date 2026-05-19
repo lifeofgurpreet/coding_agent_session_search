@@ -14408,6 +14408,27 @@ fn ensure_lexical_assets_for_search(
         return Ok(SearchLexicalSelfHeal::skipped());
     }
 
+    // Operator opt-out for the daemon warm path. On Worker 8, the daemon's
+    // own SearchClient does an equivalent diagnosis at warm-bind time and
+    // keeps the lexical view healthy from inside the daemon. Every CLI
+    // query through the daemon then re-running the diagnosis here adds a
+    // fixed ~10-20 s of `lexical_storage_fingerprint_for_db` to the
+    // observed CLI wall on the production corpus (~14 GB SQLite DB), even
+    // when the daemon serves the actual query in 50-200 ms. Setting this
+    // env var (typically in the cass-worker8-daemon.service Environment=
+    // block on the daemon host AND in the cass-boring.sh/timer environment
+    // on the client host) skips the per-query CLI fingerprint and trusts
+    // the daemon's view. Leave it unset for non-daemon CLI usage; the
+    // diagnosis is correct, just expensive per-query on large corpora.
+    if std::env::var("CASS_CLI_SKIP_SELF_HEAL").as_deref() == Ok("1") {
+        tracing::debug!(
+            data_dir = %data_dir.display(),
+            "search lexical self-heal skipped via CASS_CLI_SKIP_SELF_HEAL=1"
+        );
+        let _ = (timeout_ms, started_at);
+        return Ok(SearchLexicalSelfHeal::skipped());
+    }
+
     let initial_index_exists = crate::search::tantivy::searchable_index_exists(index_path);
     let initial_rebuild_active = probe_index_run_lock(data_dir, db_path).active;
     if initial_rebuild_active {
@@ -14641,6 +14662,60 @@ mod search_lexical_self_heal_tests {
         .expect("write lock metadata");
         lock_file.flush().expect("flush lock metadata");
         lock_file
+    }
+
+    #[test]
+    fn search_self_heal_short_circuits_when_skip_env_set() {
+        // CASS_CLI_SKIP_SELF_HEAL=1 is the operator opt-out used by Worker
+        // 8 to avoid paying per-query `lexical_storage_fingerprint_for_db`
+        // when the daemon path is handling the search. The bypass must NOT
+        // rebuild a missing lexical index — it returns "skipped" and trusts
+        // the daemon to keep its own view healthy.
+        //
+        // SAFETY: this test mutates a process-global env var, so it cannot
+        // run in parallel with other self-heal tests if they shared state.
+        // Tests using `seed_canonical_search_db` create independent
+        // tempdirs and never read CASS_CLI_SKIP_SELF_HEAL themselves, so
+        // serial conflict is bounded to the env var itself; the test
+        // restores the previous value on exit.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        assert!(!crate::search::tantivy::searchable_index_exists(
+            &index_path
+        ));
+
+        // SAFETY: setting/removing a process env var inside a test is
+        // safe so long as no other test or thread reads the same key
+        // concurrently. The CASS_CLI_SKIP_SELF_HEAL key is read only by
+        // `ensure_lexical_assets_for_search`, which is invoked
+        // sequentially in test paths via TempDirs that don't share state.
+        let previous = std::env::var("CASS_CLI_SKIP_SELF_HEAL").ok();
+        // SAFETY: see comment above.
+        unsafe { std::env::set_var("CASS_CLI_SKIP_SELF_HEAL", "1") };
+        let repair = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("self-heal short-circuits when CASS_CLI_SKIP_SELF_HEAL=1");
+        // SAFETY: see comment above; restoring prior state.
+        match previous {
+            Some(v) => unsafe { std::env::set_var("CASS_CLI_SKIP_SELF_HEAL", v) },
+            None => unsafe { std::env::remove_var("CASS_CLI_SKIP_SELF_HEAL") },
+        }
+
+        assert_eq!(repair.action, "skipped");
+        // No rebuild happened — the lexical index is still missing. The
+        // daemon path is expected to handle queries; the CLI's lexical
+        // SearchClient will simply not be opened against this dir.
+        assert!(!crate::search::tantivy::searchable_index_exists(
+            &index_path
+        ));
     }
 
     #[test]
@@ -15112,6 +15187,137 @@ mod search_lexical_self_heal_tests {
     }
 }
 
+/// Try to serve a CLI search via the warm daemon. Returns `None` when the
+/// daemon is unreachable, declines the request, or returns an undecodable
+/// payload — the caller then falls through to in-process search.
+///
+/// Crucially, this is invoked BEFORE `ensure_lexical_assets_for_search` in
+/// `run_cli_search`: when the daemon serves the request, the CLI never
+/// pays the 10-20 s `cli_self_heal` diagnosis-and-fingerprint cost. The
+/// daemon has its own resident SearchClient that doesn't need the CLI to
+/// validate lexical assets on every query.
+#[allow(clippy::too_many_arguments)]
+fn try_warm_daemon_search(
+    query: &str,
+    mode: crate::search::query::SearchMode,
+    limit: usize,
+    offset: usize,
+    sparse_threshold: usize,
+    field_mask: crate::search::query::FieldMask,
+    approximate: bool,
+    semantic_opts: &SemanticSearchOptions,
+    data_dir: &Path,
+    db_path: &Path,
+    agents: &[String],
+    workspaces: &[String],
+    source: Option<&str>,
+    time_filter: &TimeFilter,
+    hybrid_fail_open: bool,
+) -> Option<crate::search::query::SearchResult> {
+    use crate::search::query::SearchMode;
+
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            query,
+            mode,
+            limit,
+            offset,
+            sparse_threshold,
+            field_mask,
+            approximate,
+            semantic_opts,
+            data_dir,
+            db_path,
+            agents,
+            workspaces,
+            source,
+            time_filter,
+            hybrid_fail_open,
+        );
+        None
+    }
+
+    #[cfg(unix)]
+    {
+        use crate::daemon::protocol::SearchRequest;
+
+        let daemon = crate::daemon::client::try_connect()?;
+
+        let mode_str = match mode {
+            SearchMode::Lexical => "lexical",
+            SearchMode::Semantic => "semantic",
+            SearchMode::Hybrid => "hybrid",
+        }
+        .to_string();
+
+        let req = SearchRequest {
+            query: query.to_string(),
+            mode: mode_str,
+            limit,
+            offset,
+            model: semantic_opts.model.clone(),
+            approximate,
+            agents: agents.to_vec(),
+            workspaces: workspaces.to_vec(),
+            source_filter: source.map(str::to_string),
+            since: time_filter.since,
+            until: time_filter.until,
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            db_path: db_path.to_string_lossy().into_owned(),
+            field_mask_bits: field_mask.bits(),
+            preview_content_chars: field_mask.preview_content_limit(),
+            sparse_threshold,
+            hybrid_fail_open,
+        };
+
+        let wire = match daemon.search(req) {
+            Ok(wire) => wire,
+            Err(e) => {
+                tracing::debug!(error = %e, "daemon search unavailable; falling back to in-process");
+                return None;
+            }
+        };
+
+        let hits: Vec<crate::search::query::SearchHit> = match serde_json::from_str(&wire.hits_json)
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!(error = %e, "daemon search returned undecodable hits; falling back");
+                return None;
+            }
+        };
+
+        let suggestions: Vec<crate::search::query::QuerySuggestion> =
+            serde_json::from_str(&wire.suggestions_json).unwrap_or_default();
+
+        let ann_stats = match wire.ann_stats_json.as_deref() {
+            Some(json) => {
+                serde_json::from_str::<crate::search::ann_index::AnnSearchStats>(json).ok()
+            }
+            None => None,
+        };
+
+        tracing::info!(
+            elapsed_ms = wire.elapsed_ms,
+            warm_load_triggered = wire.warm_load_triggered,
+            warm_load_ms = wire.warm_load_ms,
+            embedder_id = %wire.embedder_id,
+            realized_mode = %wire.realized_mode,
+            "warm daemon search served"
+        );
+
+        Some(crate::search::query::SearchResult {
+            hits,
+            wildcard_fallback: wire.wildcard_fallback,
+            cache_stats: crate::search::query::CacheStats::default(),
+            suggestions,
+            ann_stats,
+            total_count: wire.total_count,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -15271,26 +15477,160 @@ fn run_cli_search(
         return Ok(());
     }
 
-    let search_self_heal = ensure_lexical_assets_for_search(
-        &data_dir,
-        &db_path,
-        &index_path,
-        timeout_ms,
-        start_time,
-        dry_run,
-    )?;
-    if search_self_heal.action != "skipped" {
-        tracing::info!(
-            action = search_self_heal.action,
-            reason = search_self_heal.reason.as_deref(),
-            indexed_docs = search_self_heal.indexed_docs,
-            "search lexical self-heal completed"
+    // === Cheap dispatch params (hoisted above self-heal/client-open) ===
+    //
+    // We need these resolved before the architectural daemon-first attempt
+    // below. Hoisting them here means the daemon path can short-circuit
+    // entirely WITHOUT touching the local lexical fingerprint or opening a
+    // local SearchClient, which is what solves blocker #1 from the prior
+    // Option A attempt (~10-20 s of `cli_self_heal` per CLI query against
+    // the 14 GB Worker 8 SQLite DB). The local path below reads the same
+    // hoisted bindings.
+    let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
+    let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
+    if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
+        && !matches!(mode_meta.requested, SearchMode::Semantic)
+    {
+        eprintln!("Warning: tier flags currently only affect --mode semantic.");
+    }
+
+    let sparse_threshold = 3; // Threshold for triggering wildcard fallback
+    let token_budget_page_limit = token_budget_search_limit(max_tokens);
+    let cursor_page_limit = if has_aggregation {
+        limit_val
+    } else if limit_val == 0 {
+        token_budget_page_limit.unwrap_or(0)
+    } else {
+        limit_val
+    };
+    let (search_limit, search_offset) = if has_aggregation {
+        (1000.max(limit_val + offset_val), 0)
+    } else if limit_val == 0 {
+        match token_budget_page_limit {
+            Some(page_limit) => (page_limit.saturating_add(1), offset_val),
+            None => (0, offset_val),
+        }
+    } else {
+        (limit_val.saturating_add(1), offset_val)
+    };
+    let sparse_visible_limit = if limit_val == 0 && cursor_page_limit > 0 {
+        cursor_page_limit
+    } else {
+        limit_val
+    };
+    let search_sparse_threshold =
+        sparse_threshold_for_visible_limit(sparse_threshold, sparse_visible_limit, has_aggregation);
+
+    // Check if we're already past timeout before starting search
+    let timeout_duration = timeout_ms.map(Duration::from_millis);
+    if let Some(timeout) = timeout_duration
+        && start_time.elapsed() >= timeout
+    {
+        return Err(CliError {
+            code: 10,
+            kind: CliErrorKind::Timeout.kind_str(),
+            message: format!(
+                "Operation timed out after {}ms (before search started)",
+                timeout.as_millis()
+            ),
+            hint: Some("Increase --timeout value or simplify query".to_string()),
+            retryable: true,
+        });
+    }
+
+    // Log semantic options if any are set (bd-3bbv: flags are wired, infra pending)
+    if semantic_opts.model.is_some()
+        || semantic_opts.rerank
+        || semantic_opts.reranker.is_some()
+        || semantic_opts.use_daemon
+        || semantic_opts.approximate
+        || semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
+    {
+        tracing::debug!(
+            model = ?semantic_opts.model,
+            rerank = semantic_opts.rerank,
+            reranker = ?semantic_opts.reranker,
+            use_daemon = semantic_opts.use_daemon,
+            approximate = semantic_opts.approximate,
+            tier_mode = ?semantic_opts.tier_mode,
+            "Semantic search options configured"
         );
     }
-    let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
-    let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
 
-    let client = SearchClient::open_with_options(
+    // Track search timing breakdown (T7.4)
+    let search_start = Instant::now();
+
+    // === Architectural daemon-first attempt ==============================
+    // When --use-daemon is set AND the requested mode is not pure lexical,
+    // try the warm daemon BEFORE running `ensure_lexical_assets_for_search`
+    // or `SearchClient::open_with_options`. If the daemon serves the
+    // request, the CLI never:
+    //   - runs `lexical_storage_fingerprint_for_db` (10-20 s on the Worker
+    //     8 corpus),
+    //   - opens a local Tantivy reader,
+    //   - loads local semantic context (HNSW + FSVI).
+    // The daemon has its own resident SearchClient + hydration cache +
+    // HNSW pinned via mlock; it does an equivalent lexical health check
+    // once at warm-bind time, not per query.
+    //
+    // The legacy operator override `CASS_CLI_SKIP_SELF_HEAL=1` still
+    // applies for cases where the daemon is bypassed (e.g. --mode lexical
+    // CLI usage) but the operator still wants the diagnosis skipped. It
+    // remains a belt-and-suspenders flag; the daemon-first reorder is the
+    // primary mechanism.
+    let early_daemon_result =
+        if semantic_opts.use_daemon && !matches!(mode_meta.requested, SearchMode::Lexical) {
+            try_warm_daemon_search(
+                query,
+                mode_meta.requested,
+                search_limit,
+                search_offset,
+                search_sparse_threshold,
+                field_mask,
+                semantic_opts.approximate,
+                &semantic_opts,
+                &data_dir,
+                &db_path,
+                agents,
+                workspaces,
+                source.as_deref(),
+                &time_filter,
+                hybrid_fail_open,
+            )
+        } else {
+            None
+        };
+
+    let result: crate::search::query::SearchResult = if let Some(daemon_result) =
+        early_daemon_result
+    {
+        daemon_result
+    } else {
+        // === Local path: daemon was unavailable or declined ==============
+        // Self-heal first (now only on the local-search path), then open
+        // the local SearchClient, load semantic context, and dispatch.
+
+        let search_self_heal = ensure_lexical_assets_for_search(
+            &data_dir,
+            &db_path,
+            &index_path,
+            timeout_ms,
+            start_time,
+            dry_run,
+        )?;
+        if search_self_heal.action != "skipped" {
+            tracing::info!(
+                action = search_self_heal.action,
+                reason = search_self_heal.reason.as_deref(),
+                indexed_docs = search_self_heal.indexed_docs,
+                "search lexical self-heal completed"
+            );
+        }
+        let tantivy_index_initialized =
+            crate::search::tantivy::searchable_index_exists(&index_path);
+        let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
+
+        let client = SearchClient::open_with_options(
         &index_path,
         Some(&db_path),
         SearchClientOptions {
@@ -15357,249 +15697,184 @@ fn run_cli_search(
         }
     })?;
 
-    if !client.has_tantivy() {
-        eprintln!(
-            "Warning: Tantivy search index not found at {}. \
+        if !client.has_tantivy() {
+            eprintln!(
+                "Warning: Tantivy search index not found at {}. \
              Results will be severely limited. \
              Run `cass index --full` to rebuild the index.",
-            index_path.display()
-        );
-    }
-
-    // Hybrid is a preference for semantic refinement, not a strict dependency.
-    // If semantic assets are unavailable, hybrid searches fail open to lexical
-    // while robot metadata reports the realized mode and fallback reason.
-    let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
-    let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
-
-    if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
-        && !matches!(mode_meta.requested, SearchMode::Semantic)
-    {
-        eprintln!("Warning: tier flags currently only affect --mode semantic.");
-    }
-
-    if matches!(
-        mode_meta.requested,
-        SearchMode::Semantic | SearchMode::Hybrid
-    ) {
-        use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
-
-        // Use embedder registry for model selection (bd-2mbe)
-        let registry = EmbedderRegistry::new(&data_dir);
-        let requested_model = semantic_opts.model.as_deref();
-
-        // Validate requested model if specified
-        if let Some(model_name) = requested_model
-            && let Err(e) = registry.validate(model_name)
-        {
-            return Err(CliError {
-                code: 15,
-                kind: CliErrorKind::EmbedderUnavailable.kind_str(),
-                message: format!("Embedder validation failed: {e}"),
-                hint: Some("Run 'cass models list' to see available embedders".to_string()),
-                retryable: false,
-            });
+                index_path.display()
+            );
         }
 
-        // Determine which embedder to use
-        let embedder_info = match requested_model {
-            Some(name) => registry.get(name),
-            None => Some(registry.best_available()),
-        };
-        let prefer_hash = embedder_info.is_some_and(|e| e.name == HASH_EMBEDDER);
+        // mode_meta + hybrid_fail_open + tier warning were hoisted above the
+        // daemon-first attempt; we read the same `mut` binding here. The
+        // semantic context loader below may mutate `mode_meta.realized` via
+        // `fall_back_to_lexical` when an embedder is missing.
 
-        let setup = if prefer_hash {
-            load_hash_semantic_context(&data_dir, &db_path)
-        } else {
-            load_semantic_context(&data_dir, &db_path)
-        };
+        if matches!(
+            mode_meta.requested,
+            SearchMode::Semantic | SearchMode::Hybrid
+        ) {
+            use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
 
-        if let Some(context) = setup.context {
-            let embedder = context.embedder;
-            let index = context.index;
-            let additional_indexes = context.additional_indexes;
-            let filter_maps = context.filter_maps;
-            let roles = context.roles;
+            // Use embedder registry for model selection (bd-2mbe)
+            let registry = EmbedderRegistry::new(&data_dir);
+            let requested_model = semantic_opts.model.as_deref();
 
-            let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
-                use crate::search::daemon_client::{DaemonFallbackEmbedder, DaemonRetryConfig};
+            // Validate requested model if specified
+            if let Some(model_name) = requested_model
+                && let Err(e) = registry.validate(model_name)
+            {
+                return Err(CliError {
+                    code: 15,
+                    kind: CliErrorKind::EmbedderUnavailable.kind_str(),
+                    message: format!("Embedder validation failed: {e}"),
+                    hint: Some("Run 'cass models list' to see available embedders".to_string()),
+                    retryable: false,
+                });
+            }
 
-                #[cfg(unix)]
-                {
-                    let daemon = crate::daemon::client::try_connect()
-                        .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
-                        .unwrap_or_else(|| {
-                            Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                                "daemon-unconfigured",
-                            ))
-                        });
-                    let config = DaemonRetryConfig::from_env();
-                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
-                }
-                #[cfg(not(unix))]
-                {
-                    let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                        "daemon-unconfigured",
-                    ));
-                    let config = DaemonRetryConfig::from_env();
-                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
-                }
+            // Determine which embedder to use
+            let embedder_info = match requested_model {
+                Some(name) => registry.get(name),
+                None => Some(registry.best_available()),
+            };
+            let prefer_hash = embedder_info.is_some_and(|e| e.name == HASH_EMBEDDER);
+
+            let setup = if prefer_hash {
+                load_hash_semantic_context(&data_dir, &db_path)
             } else {
-                embedder
+                load_semantic_context(&data_dir, &db_path)
             };
 
-            let ann_path = Some(
-                data_dir
-                    .join(crate::search::vector_index::VECTOR_INDEX_DIR)
-                    .join(format!("hnsw-{}.chsw", embedder.id())),
-            );
-            let mut indexes = Vec::with_capacity(additional_indexes.len().saturating_add(1));
-            indexes.push(index);
-            indexes.extend(additional_indexes);
-            if let Err(err) =
-                client.set_semantic_indexes_context(embedder, indexes, filter_maps, roles, ann_path)
-            {
-                let hint = if prefer_hash {
-                    "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
+            if let Some(context) = setup.context {
+                let embedder = context.embedder;
+                let index = context.index;
+                let additional_indexes = context.additional_indexes;
+                let filter_maps = context.filter_maps;
+                let roles = context.roles;
+
+                let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts
+                    .use_daemon
+                {
+                    use crate::search::daemon_client::{DaemonFallbackEmbedder, DaemonRetryConfig};
+
+                    #[cfg(unix)]
+                    {
+                        let daemon = crate::daemon::client::try_connect()
+                            .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
+                            .unwrap_or_else(|| {
+                                Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                                    "daemon-unconfigured",
+                                ))
+                            });
+                        let config = DaemonRetryConfig::from_env();
+                        Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                            "daemon-unconfigured",
+                        ));
+                        let config = DaemonRetryConfig::from_env();
+                        Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                    }
+                } else {
+                    embedder
+                };
+
+                let ann_path = Some(
+                    data_dir
+                        .join(crate::search::vector_index::VECTOR_INDEX_DIR)
+                        .join(format!("hnsw-{}.chsw", embedder.id())),
+                );
+                let mut indexes = Vec::with_capacity(additional_indexes.len().saturating_add(1));
+                indexes.push(index);
+                indexes.extend(additional_indexes);
+                if let Err(err) = client.set_semantic_indexes_context(
+                    embedder,
+                    indexes,
+                    filter_maps,
+                    roles,
+                    ann_path,
+                ) {
+                    let hint = if prefer_hash {
+                        "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
                         .to_string()
+                    } else {
+                        "Run 'cass models install' and then 'cass index --semantic', or omit --mode semantic when lexical evidence is acceptable"
+                        .to_string()
+                    };
+                    if hybrid_fail_open {
+                        mode_meta.fall_back_to_lexical(format!("semantic context rejected: {err}"));
+                        let _ = client.clear_semantic_context();
+                    } else {
+                        return Err(CliError {
+                            code: 15,
+                            kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                            message: format!("Semantic search not available: {err}"),
+                            hint: Some(hint),
+                            retryable: false,
+                        });
+                    }
+                }
+            } else {
+                let _ = client.clear_semantic_context();
+                let summary = setup.availability.summary();
+                let hint = if prefer_hash {
+                    "Run 'cass index --semantic --embedder hash' to build the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
+                    .to_string()
                 } else {
                     "Run 'cass models install' and then 'cass index --semantic', or omit --mode semantic when lexical evidence is acceptable"
-                        .to_string()
+                    .to_string()
                 };
                 if hybrid_fail_open {
-                    mode_meta.fall_back_to_lexical(format!("semantic context rejected: {err}"));
-                    let _ = client.clear_semantic_context();
+                    mode_meta
+                        .fall_back_to_lexical(format!("semantic context unavailable: {summary}"));
                 } else {
                     return Err(CliError {
                         code: 15,
                         kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                        message: format!("Semantic search not available: {err}"),
+                        message: format!("Semantic search not available: {summary}"),
                         hint: Some(hint),
                         retryable: false,
                     });
                 }
             }
-        } else {
-            let _ = client.clear_semantic_context();
-            let summary = setup.availability.summary();
-            let hint = if prefer_hash {
-                "Run 'cass index --semantic --embedder hash' to build the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
-                    .to_string()
+        }
+
+        let approximate =
+            if semantic_opts.approximate && matches!(mode_meta.realized, SearchMode::Lexical) {
+                eprintln!("Warning: --approximate has no effect in lexical mode.");
+                false
             } else {
-                "Run 'cass models install' and then 'cass index --semantic', or omit --mode semantic when lexical evidence is acceptable"
-                    .to_string()
+                semantic_opts.approximate
             };
-            if hybrid_fail_open {
-                mode_meta.fall_back_to_lexical(format!("semantic context unavailable: {summary}"));
-            } else {
-                return Err(CliError {
-                    code: 15,
-                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                    message: format!("Semantic search not available: {summary}"),
-                    hint: Some(hint),
-                    retryable: false,
-                });
-            }
-        }
-    }
 
-    let approximate =
-        if semantic_opts.approximate && matches!(mode_meta.realized, SearchMode::Lexical) {
-            eprintln!("Warning: --approximate has no effect in lexical mode.");
-            false
-        } else {
-            semantic_opts.approximate
-        };
-
-    // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
-    let sparse_threshold = 3; // Threshold for triggering wildcard fallback
-
-    // When aggregating, we need more results for accurate counts.
-    // For non-aggregation mode, overfetch by one so cursor pagination can reliably
-    // signal whether additional pages exist without a second query.
-    let token_budget_page_limit = token_budget_search_limit(max_tokens);
-    let cursor_page_limit = if has_aggregation {
-        limit_val
-    } else if limit_val == 0 {
-        token_budget_page_limit.unwrap_or(0)
-    } else {
-        limit_val
-    };
-    let (search_limit, search_offset) = if has_aggregation {
-        (1000.max(limit_val + offset_val), 0)
-    } else if limit_val == 0 {
-        match token_budget_page_limit {
-            Some(page_limit) => (page_limit.saturating_add(1), offset_val),
-            None => (0, offset_val),
-        }
-    } else {
-        (limit_val.saturating_add(1), offset_val)
-    };
-    let sparse_visible_limit = if limit_val == 0 && cursor_page_limit > 0 {
-        cursor_page_limit
-    } else {
-        limit_val
-    };
-    let search_sparse_threshold =
-        sparse_threshold_for_visible_limit(sparse_threshold, sparse_visible_limit, has_aggregation);
-
-    // Check if we're already past timeout before starting search
-    let timeout_duration = timeout_ms.map(Duration::from_millis);
-    if let Some(timeout) = timeout_duration
-        && start_time.elapsed() >= timeout
-    {
-        return Err(CliError {
-            code: 10,
-            kind: CliErrorKind::Timeout.kind_str(),
-            message: format!(
-                "Operation timed out after {}ms (before search started)",
-                timeout.as_millis()
-            ),
-            hint: Some("Increase --timeout value or simplify query".to_string()),
-            retryable: true,
-        });
-    }
-
-    // Log semantic options if any are set (bd-3bbv: flags are wired, infra pending)
-    if semantic_opts.model.is_some()
-        || semantic_opts.rerank
-        || semantic_opts.reranker.is_some()
-        || semantic_opts.use_daemon
-        || semantic_opts.approximate
-        || semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
-    {
-        tracing::debug!(
-            model = ?semantic_opts.model,
-            rerank = semantic_opts.rerank,
-            reranker = ?semantic_opts.reranker,
-            use_daemon = semantic_opts.use_daemon,
-            approximate = semantic_opts.approximate,
-            tier_mode = ?semantic_opts.tier_mode,
-            "Semantic search options configured"
-        );
-    }
-
-    // Track search timing breakdown (T7.4)
-    let search_start = Instant::now();
-    let result = match mode_meta.realized {
-        SearchMode::Lexical => client
-            .search_with_fallback(
-                query,
-                filters.clone(),
-                search_limit,
-                search_offset,
-                search_sparse_threshold,
-                field_mask,
-            )
-            .map_err(|e| CliError {
-                code: 9,
-                kind: CliErrorKind::Search.kind_str(),
-                message: format!("search failed: {e}"),
-                hint: None,
-                retryable: true,
-            })?,
-        SearchMode::Semantic => {
-            let (hits, ann_stats) = client
+        // Local search dispatch. `search_limit`, `search_offset`,
+        // `search_sparse_threshold`, `hybrid_fail_open`, `search_start`, and
+        // `mode_meta` were all resolved above the daemon-first attempt; we
+        // read them here. `mode_meta.realized` may have been downgraded to
+        // Lexical by the semantic context loader above.
+        match mode_meta.realized {
+            SearchMode::Lexical => client
+                .search_with_fallback(
+                    query,
+                    filters.clone(),
+                    search_limit,
+                    search_offset,
+                    search_sparse_threshold,
+                    field_mask,
+                )
+                .map_err(|e| CliError {
+                    code: 9,
+                    kind: CliErrorKind::Search.kind_str(),
+                    message: format!("search failed: {e}"),
+                    hint: None,
+                    retryable: true,
+                })?,
+            SearchMode::Semantic => {
+                let (hits, ann_stats) = client
                 .search_semantic_with_tier(
                     query,
                     filters.clone(),
@@ -15646,33 +15921,34 @@ fn run_cli_search(
                         }
                     }
                 })?;
-            crate::search::query::SearchResult {
-                hits,
-                wildcard_fallback: false,
-                cache_stats: crate::search::query::CacheStats::default(),
-                suggestions: Vec::new(),
-                ann_stats,
-                total_count: None,
+                crate::search::query::SearchResult {
+                    hits,
+                    wildcard_fallback: false,
+                    cache_stats: crate::search::query::CacheStats::default(),
+                    suggestions: Vec::new(),
+                    ann_stats,
+                    total_count: None,
+                }
             }
-        }
-        SearchMode::Hybrid => match client.search_hybrid(
-            query,
-            query,
-            filters.clone(),
-            search_limit,
-            search_offset,
-            search_sparse_threshold,
-            field_mask,
-            approximate,
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                let err_str = e.to_string();
-                if hybrid_fail_open
-                    && (err_str.contains("unavailable") || err_str.contains("no embedder"))
-                {
-                    mode_meta.fall_back_to_lexical(format!("hybrid execution unavailable: {e}"));
-                    client
+            SearchMode::Hybrid => match client.search_hybrid(
+                query,
+                query,
+                filters.clone(),
+                search_limit,
+                search_offset,
+                search_sparse_threshold,
+                field_mask,
+                approximate,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if hybrid_fail_open
+                        && (err_str.contains("unavailable") || err_str.contains("no embedder"))
+                    {
+                        mode_meta
+                            .fall_back_to_lexical(format!("hybrid execution unavailable: {e}"));
+                        client
                         .search_with_fallback(
                             query,
                             filters.clone(),
@@ -15690,8 +15966,8 @@ fn run_cli_search(
                             hint: None,
                             retryable: true,
                         })?
-                } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
-                    return Err(CliError {
+                    } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
+                        return Err(CliError {
                         code: 15,
                         kind: CliErrorKind::SemanticUnavailable.kind_str(),
                         message: "Hybrid search not available (requires semantic search)".to_string(),
@@ -15701,8 +15977,8 @@ fn run_cli_search(
                         ),
                         retryable: false,
                     });
-                } else {
-                    return Err(CliError {
+                    } else {
+                        return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::Search.kind_str(),
                         message: format!("hybrid search failed: {e}"),
@@ -15712,9 +15988,10 @@ fn run_cli_search(
                         ),
                         retryable: true,
                     });
+                    }
                 }
-            }
-        },
+            },
+        }
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
 

@@ -46,6 +46,7 @@ pub mod core;
 pub mod models;
 pub mod protocol;
 pub mod resource;
+pub mod warm_search;
 pub mod worker;
 
 use std::path::{Path, PathBuf};

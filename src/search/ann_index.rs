@@ -11,7 +11,7 @@ use crate::search::vector_index::VECTOR_INDEX_DIR;
 /// Statistics from an ANN search operation.
 ///
 /// These metrics help users understand the quality/speed tradeoff of approximate search.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AnnSearchStats {
     /// Total vectors in the HNSW index.
     pub index_size: usize,

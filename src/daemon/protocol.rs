@@ -69,8 +69,75 @@ pub enum Request {
         model_id: Option<String>,
     },
 
+    /// Run a search against a daemon-resident SearchClient. The daemon keeps
+    /// the Tantivy reader, FSVI vector index, and HNSW graph warm in memory
+    /// keyed by (data_dir, db_path), so this avoids the multi-second cold
+    /// load every CLI invocation otherwise pays.
+    Search(SearchRequest),
+
+    /// Pre-warm the daemon's SearchClient for a given (data_dir, db_path)
+    /// without running a query. Useful on daemon startup or after a rebuild.
+    WarmSearch {
+        data_dir: String,
+        db_path: String,
+        /// Optional explicit semantic model name (e.g. "hash", "minilm-384").
+        /// When None, daemon picks the best indexed tier.
+        model: Option<String>,
+    },
+
+    /// Drop a warm SearchClient and free its index memory. Caller must
+    /// canonicalize paths the same way the daemon does (passing the original
+    /// strings is fine; daemon canonicalizes both sides).
+    EvictSearch { data_dir: String, db_path: String },
+
     /// Request graceful shutdown.
     Shutdown,
+}
+
+/// Search invocation parameters sent from CLI to daemon.
+///
+/// The wire format intentionally uses primitive/string types so the protocol
+/// stays stable across internal type refactors. `mode` is one of
+/// "lexical" | "semantic" | "hybrid". `field_mask_bits` carries the raw flag
+/// bits of `FieldMask`; `preview_content_chars` carries the optional
+/// content-preview cap that is deliberately not encoded in those bits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchRequest {
+    /// Search query string (NFC normalization happens inside SearchClient).
+    pub query: String,
+    /// "lexical" | "semantic" | "hybrid"
+    pub mode: String,
+    /// Page size (0 = unlimited up to engine cap).
+    pub limit: usize,
+    /// Page offset.
+    pub offset: usize,
+    /// Explicit embedder name. None = best indexed tier.
+    pub model: Option<String>,
+    /// Use approximate (HNSW) search. Only meaningful for semantic/hybrid.
+    pub approximate: bool,
+    /// Agent filter (empty = all).
+    pub agents: Vec<String>,
+    /// Workspace filter (empty = all).
+    pub workspaces: Vec<String>,
+    /// Optional source filter expression ("local", "remote:foo", etc.).
+    pub source_filter: Option<String>,
+    /// Created-from filter, unix seconds.
+    pub since: Option<i64>,
+    /// Created-to filter, unix seconds.
+    pub until: Option<i64>,
+    /// Path to the CASS data directory (FSVI + HNSW sidecars live here).
+    pub data_dir: String,
+    /// Path to the SQLite archive database.
+    pub db_path: String,
+    /// FieldMask bitfield (NEEDS_CONTENT, WANTS_SNIPPET, WANTS_TITLE, ALLOWS_CACHE).
+    pub field_mask_bits: u32,
+    /// Optional preview limit for content fields. None means full content.
+    pub preview_content_chars: Option<usize>,
+    /// Sparse threshold for wildcard fallback in lexical mode.
+    pub sparse_threshold: usize,
+    /// Whether the daemon should fail-open to lexical when semantic context
+    /// is unavailable (matches CLI hybrid_fail_open semantics).
+    pub hybrid_fail_open: bool,
 }
 
 /// Response types from the daemon.
@@ -97,11 +164,59 @@ pub enum Response {
     /// Embedding jobs cancelled.
     JobCancelled { cancelled: usize, message: String },
 
+    /// Search response. The hits are encoded as a JSON string to avoid
+    /// dragging Deserialize impls into every internal search type — JSON is
+    /// also what the CLI ultimately renders for --json output, so the daemon
+    /// path is zero-copy in that common case.
+    Search(SearchResponseWire),
+
+    /// SearchClient warmed (or already warm) for the given keys.
+    SearchWarmed {
+        data_dir: String,
+        db_path: String,
+        embedder_id: String,
+        warm_load_ms: u64,
+        already_warm: bool,
+    },
+
+    /// SearchClient evicted (or wasn't present).
+    SearchEvicted {
+        data_dir: String,
+        db_path: String,
+        was_warm: bool,
+    },
+
     /// Shutdown acknowledgement.
     Shutdown { message: String },
 
     /// Error response.
     Error(ErrorResponse),
+}
+
+/// Wire format for a search response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResponseWire {
+    /// JSON-serialized array of SearchHit objects, in result order.
+    pub hits_json: String,
+    /// Whether the engine fell back to wildcard fallback for sparse lexical results.
+    pub wildcard_fallback: bool,
+    /// JSON-serialized AnnSearchStats, or null when ANN was not used.
+    pub ann_stats_json: Option<String>,
+    /// True total matching documents from the engine when available.
+    pub total_count: Option<usize>,
+    /// JSON-serialized array of QuerySuggestion (did-you-mean), if any.
+    pub suggestions_json: String,
+    /// Realized search mode after fallback ("lexical", "semantic", "hybrid").
+    pub realized_mode: String,
+    /// Embedder id actually used ("hash", "fnv1a-384", "minilm-384", etc).
+    /// Empty for pure-lexical responses.
+    pub embedder_id: String,
+    /// Total time the daemon spent on this request, including any warm load.
+    pub elapsed_ms: u64,
+    /// True if the daemon had to load the SearchClient (cold path).
+    pub warm_load_triggered: bool,
+    /// Time spent loading the SearchClient when warm_load_triggered is true.
+    pub warm_load_ms: u64,
 }
 
 /// Health status of the daemon.
@@ -434,6 +549,70 @@ mod tests {
         assert!(matches!(&decoded.payload, Response::Rerank(_)));
         if let Response::Rerank(resp) = decoded.payload {
             assert_eq!(resp.scores, vec![0.95, 0.72, 0.31]);
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_search_request_preserves_field_mask_preview_limit() {
+        let msg = FramedMessage::new(
+            "req-search",
+            Request::Search(SearchRequest {
+                query: "agent mail legacy cli".to_string(),
+                mode: "semantic".to_string(),
+                limit: 3,
+                offset: 0,
+                model: Some("hash".to_string()),
+                approximate: true,
+                agents: vec!["codex".to_string()],
+                workspaces: vec!["/home/gurpreet".to_string()],
+                source_filter: Some("local".to_string()),
+                since: Some(1_733_000_000),
+                until: Some(1_733_100_000),
+                data_dir: "/home/gurpreet/cass-worker8/data".to_string(),
+                db_path: "/home/gurpreet/cass-worker8/data/agent_search.db".to_string(),
+                field_mask_bits: 0b1011,
+                preview_content_chars: Some(512),
+                sparse_threshold: 3,
+                hybrid_fail_open: false,
+            }),
+        );
+        let encoded = encode_message(&msg).unwrap();
+        let decoded: FramedMessage<Request> = decode_message(&encoded[4..]).unwrap();
+
+        assert!(matches!(&decoded.payload, Request::Search(_)));
+        if let Request::Search(req) = decoded.payload {
+            assert_eq!(req.query, "agent mail legacy cli");
+            assert_eq!(req.mode, "semantic");
+            assert!(req.approximate);
+            assert_eq!(req.field_mask_bits, 0b1011);
+            assert_eq!(req.preview_content_chars, Some(512));
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_search_response_wire() {
+        let msg = FramedMessage::new(
+            "resp-search",
+            Response::Search(SearchResponseWire {
+                hits_json: "[]".to_string(),
+                wildcard_fallback: false,
+                ann_stats_json: None,
+                total_count: Some(0),
+                suggestions_json: "[]".to_string(),
+                realized_mode: "hybrid".to_string(),
+                embedder_id: "fnv1a-384".to_string(),
+                elapsed_ms: 42,
+                warm_load_triggered: false,
+                warm_load_ms: 0,
+            }),
+        );
+        let encoded = encode_message(&msg).unwrap();
+        let decoded: FramedMessage<Response> = decode_message(&encoded[4..]).unwrap();
+        assert!(matches!(&decoded.payload, Response::Search(_)));
+        if let Response::Search(wire) = decoded.payload {
+            assert_eq!(wire.realized_mode, "hybrid");
+            assert_eq!(wire.embedder_id, "fnv1a-384");
+            assert_eq!(wire.elapsed_ms, 42);
         }
     }
 }

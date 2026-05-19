@@ -328,7 +328,7 @@ pub fn sql_placeholders(count: usize) -> String {
     result
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SearchFilters {
     pub agents: HashSet<String>,
     pub workspaces: HashSet<String>,
@@ -1039,7 +1039,7 @@ impl QueryExplanation {
 
 /// Indicates how a search result matched the query.
 /// Used for ranking: exact matches rank higher than wildcard matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchType {
     /// No wildcards - matched via exact term or edge n-gram prefix
@@ -1072,7 +1072,7 @@ impl MatchType {
 }
 
 /// Type of suggestion for did-you-mean
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SuggestionKind {
     /// Typo correction (Levenshtein distance)
@@ -1088,7 +1088,7 @@ pub enum SuggestionKind {
 }
 
 /// A "did-you-mean" suggestion when search returns zero hits.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QuerySuggestion {
     /// What kind of suggestion this is
     pub kind: SuggestionKind,
@@ -1225,16 +1225,32 @@ impl FieldMask {
     pub fn preview_content_limit(self) -> Option<usize> {
         self.preview_content_chars
     }
+
+    /// Reconstruct a FieldMask from its raw flag bits. Used to ferry the mask
+    /// across the daemon protocol without expanding the wire format every
+    /// time we add a new field. Preview-content cap is carried separately on
+    /// the wire (`preview_content_chars`) and re-applied by the daemon.
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            flags: (bits & 0xFF) as u8,
+            preview_content_chars: None,
+        }
+    }
+
+    /// Raw bit representation for serialization.
+    pub fn bits(self) -> u32 {
+        self.flags as u32
+    }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchHit {
     pub title: String,
     pub snippet: String,
     pub content: String,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub content_hash: u64,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub conversation_id: Option<i64>,
     pub score: f32,
     pub source_path: String,
@@ -1968,6 +1984,112 @@ fn semantic_filter_as_search_filter(filter: &SemanticFilter) -> Option<&dyn FsSe
     if unrestricted { None } else { Some(filter) }
 }
 
+/// Default capacity for the per-SemanticSearchState hydration cache.
+///
+/// Sized to fit the entire ~1M-message corpus on Worker 8 without LRU
+/// eviction. Memory cost at full population is approximately
+/// `capacity * avg_hit_size`, which for a typical agent corpus is on the
+/// order of 5 GiB (2 KiB average content, plus title/metadata). Worker 8
+/// runs the daemon with `LimitMEMLOCK=38G` so this fits comfortably under
+/// the mlockall pin without breaching the rlimit. The cache is bounded by
+/// `CASS_HYDRATION_CACHE_CAPACITY` env var when a smaller bound is wanted.
+const HYDRATION_CACHE_DEFAULT_CAPACITY: usize = 1_048_576;
+
+/// Per-(message_id, field_mask) key for the hydration cache.
+///
+/// `field_mask_bits` is in the key because two callers requesting the
+/// same message with different field masks should NOT share an entry —
+/// a hit cached as title-only would be missing content fields, and
+/// returning it for a content-needs caller would produce incorrect
+/// results. The prewarm path always inserts with `FieldMask::FULL`, so
+/// any field-mask subset can be served by trimming a FULL entry.
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+struct HydrationCacheKey {
+    message_id: u64,
+    field_mask_bits: u32,
+}
+
+/// Per-SemanticSearchState cache of hydrated `SearchHit`s keyed by
+/// `(message_id, field_mask_bits)`. Skips the SQL JOIN on repeat hits.
+///
+/// Lifecycle: created in `set_semantic_context`, dropped together with
+/// the SemanticSearchState when context is re-bound. Bounded by
+/// `CASS_HYDRATION_CACHE_CAPACITY` (default 1_048_576).
+struct HydrationCache {
+    inner: Mutex<LruCache<HydrationCacheKey, Arc<SearchHit>>>,
+}
+
+impl HydrationCache {
+    fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            inner: Mutex::new(LruCache::new(capacity)),
+        }
+    }
+
+    fn from_env_or_default() -> Self {
+        let capacity = std::env::var("CASS_HYDRATION_CACHE_CAPACITY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(HYDRATION_CACHE_DEFAULT_CAPACITY);
+        let capacity = NonZeroUsize::new(capacity)
+            .unwrap_or_else(|| NonZeroUsize::new(HYDRATION_CACHE_DEFAULT_CAPACITY).unwrap());
+        Self::new(capacity)
+    }
+
+    /// Look up a hit for the given key. Returns `None` on miss or lock
+    /// poisoning (errors fall back to SQL hydration as if the cache were
+    /// empty — never a correctness issue, only a perf miss).
+    ///
+    /// Falls back to a `FieldMask::FULL` entry if the exact-mask lookup
+    /// misses. The prewarm path always populates with FULL, so any query
+    /// that asks for a subset of fields can be served from the prewarmed
+    /// entry. The returned `SearchHit` has fields the caller didn't ask
+    /// for trimmed to empty strings to preserve the field-mask contract.
+    fn get(&self, message_id: u64, field_mask: FieldMask) -> Option<Arc<SearchHit>> {
+        let key = HydrationCacheKey {
+            message_id,
+            field_mask_bits: field_mask.bits(),
+        };
+        let mut guard = self.inner.lock().ok()?;
+        if let Some(hit) = guard.get(&key).cloned() {
+            return Some(hit);
+        }
+        // Fall back to the FULL-mask prewarm entry, trimming on the way out.
+        let full_key = HydrationCacheKey {
+            message_id,
+            field_mask_bits: FieldMask::FULL.bits(),
+        };
+        let full_hit = guard.get(&full_key).cloned()?;
+        drop(guard);
+        if field_mask.bits() == FieldMask::FULL.bits() {
+            return Some(full_hit);
+        }
+        let mut trimmed = (*full_hit).clone();
+        if !field_mask.wants_title() {
+            trimmed.title = String::new();
+        }
+        if !field_mask.wants_snippet() {
+            trimmed.snippet = String::new();
+        }
+        if !field_mask.needs_content() {
+            trimmed.content = String::new();
+        }
+        Some(Arc::new(trimmed))
+    }
+
+    /// Insert a freshly-hydrated hit. Silently no-ops on lock poisoning.
+    fn put(&self, message_id: u64, field_mask: FieldMask, hit: Arc<SearchHit>) {
+        let key = HydrationCacheKey {
+            message_id,
+            field_mask_bits: field_mask.bits(),
+        };
+        if let Ok(mut cache) = self.inner.lock() {
+            cache.put(key, hit);
+        }
+    }
+}
+
 fn open_fs_semantic_ann_index(fs_index: &FsVectorIndex, ann_path: &Path) -> Result<FsHnswIndex> {
     if !ann_path.is_file() {
         bail!(
@@ -2005,6 +2127,11 @@ struct SemanticSearchState {
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
     query_cache: QueryCache,
+    /// Cache of fully-hydrated `SearchHit`s keyed by
+    /// `(message_id, field_mask_bits)`. Skips the JOIN-heavy SQL path on
+    /// repeat hits. `Arc` so a `&Self` reader can clone the cache out of
+    /// the semantic mutex once and then operate without holding it.
+    hydration_cache: Arc<HydrationCache>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3764,6 +3891,7 @@ impl SearchClient {
             filter_maps,
             roles,
             query_cache: QueryCache::new(embedder_id.as_str(), capacity),
+            hydration_cache: Arc::new(HydrationCache::from_env_or_default()),
         });
         if shard_count > 1 {
             tracing::info!(
@@ -3783,6 +3911,143 @@ impl SearchClient {
             .map_err(|_| anyhow!("semantic lock poisoned"))?;
         *guard = None;
         Ok(())
+    }
+
+    /// Force-load the HNSW accelerator so the next approximate-search call
+    /// doesn't pay the multi-second `reload_hnsw` cost. Returns Ok(false) if
+    /// no `ann_path` is bound (no HNSW available); Ok(true) if loaded
+    /// successfully. Errors propagate when the file is present but invalid.
+    pub fn warmup_ann(&self) -> Result<bool> {
+        let has_ann_path = {
+            let guard = self
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            guard
+                .as_ref()
+                .and_then(|s| s.ann_path.as_ref())
+                .is_some_and(|p| p.is_file())
+        };
+        if !has_ann_path {
+            return Ok(false);
+        }
+        let _ = self.ann_index()?;
+        Ok(true)
+    }
+
+    /// Pre-populate the hydration cache with EVERY message's full hydrated
+    /// `SearchHit` so subsequent semantic queries are served from in-memory
+    /// `HashMap` lookups instead of paying fsqlite's full-table-scan cost
+    /// on the cold path.
+    ///
+    /// Background: live VPS benchmark (CTE rewrite, K=12 hydration) showed
+    /// cold-query p50 of 15-43 s. strace identified 138K `pread64` calls
+    /// per cold query — fsqlite's planner chose `full_table_scan` on the
+    /// 872K-row `messages` table for what should have been a primary-key
+    /// IN-list lookup (native sqlite3 does the same query in 19 ms). The
+    /// only durable workaround is to bypass fsqlite on the hot path.
+    ///
+    /// This method takes the one-time scan cost (~30 s) at warm-bind so
+    /// every subsequent query is sub-100 ms. Disabled via
+    /// `CASS_DAEMON_PREWARM_HYDRATION=0` for callers that want lazy
+    /// behavior.
+    pub fn prewarm_hydration_cache(&self) -> Result<usize> {
+        if std::env::var("CASS_DAEMON_PREWARM_HYDRATION").as_deref() == Ok("0") {
+            return Ok(0);
+        }
+        let cache = self
+            .semantic_hydration_cache()
+            .ok_or_else(|| anyhow!("semantic context not bound; cannot prewarm hydration"))?;
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("semantic search requires database connection for prewarm"))?;
+
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+        // Same JOIN shape as `hydrate_semantic_hits_with_ids` but unfiltered
+        // — fsqlite issues a single full scan instead of one per query.
+        let sql = format!(
+            "SELECT m.id, c.id, m.content, m.created_at, m.idx, m.role, c.title, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             LEFT JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN sources s ON c.source_id = s.id"
+        );
+
+        let full_mask = FieldMask::FULL;
+        let started = Instant::now();
+        let rows: Vec<(u64, SearchHit)> =
+            conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+                let message_id: i64 = row.get_typed(0)?;
+                let conversation_id: i64 = row.get_typed(1)?;
+                let full_content: String = row.get_typed(2)?;
+                let msg_created_at: Option<i64> = row.get_typed(3)?;
+                let idx: Option<i64> = row.get_typed(4)?;
+                let title: Option<String> = row.get_typed(6)?;
+                let source_path: String = row.get_typed(7)?;
+                let raw_source_id: String = row.get_typed(8)?;
+                let origin_host: Option<String> = row.get_typed(9)?;
+                let agent: String = row.get_typed(10)?;
+                let workspace: Option<String> = row.get_typed(11)?;
+                let raw_origin_kind: Option<String> = row.get_typed(12)?;
+                let started_at: Option<i64> = row.get_typed(13)?;
+
+                let created_at = msg_created_at.or(started_at);
+                let line_number = idx
+                    .and_then(|i| usize::try_from(i).ok())
+                    .map(|i| i.saturating_add(1));
+                let snippet = snippet_from_content(&full_content);
+                let content_hash =
+                    stable_hit_hash(&full_content, &source_path, line_number, created_at);
+                let source_id = normalized_search_hit_source_id_parts(
+                    raw_source_id.as_str(),
+                    raw_origin_kind.as_deref().unwrap_or_default(),
+                    origin_host.as_deref(),
+                );
+                let origin_kind =
+                    normalized_search_hit_origin_kind(&source_id, raw_origin_kind.as_deref());
+                let hit = SearchHit {
+                    title: title.unwrap_or_default(),
+                    snippet,
+                    content: full_content,
+                    content_hash,
+                    conversation_id: Some(conversation_id),
+                    score: 0.0,
+                    source_path,
+                    agent,
+                    workspace: workspace.unwrap_or_default(),
+                    workspace_original: None,
+                    created_at,
+                    line_number,
+                    match_type: MatchType::Exact,
+                    source_id,
+                    origin_kind,
+                    origin_host,
+                };
+                Ok((semantic_message_id_from_db(message_id)?, hit))
+            })?;
+
+        let load_ms = started.elapsed().as_millis();
+        let count = rows.len();
+        for (id, hit) in rows {
+            cache.put(id, full_mask, Arc::new(hit));
+        }
+        tracing::info!(
+            entries = count,
+            load_ms = load_ms as u64,
+            "hydration cache fully prewarmed"
+        );
+        Ok(count)
+    }
+
+    /// Clone an `Arc<HydrationCache>` out of the semantic state without
+    /// holding the semantic mutex during the cache's own LruCache
+    /// operations. Returns `None` if no semantic context is active.
+    fn semantic_hydration_cache(&self) -> Option<Arc<HydrationCache>> {
+        let guard = self.semantic.lock().ok()?;
+        guard.as_ref().map(|s| s.hydration_cache.clone())
     }
 
     fn semantic_context_matches(&self, context_token: &Arc<()>) -> Result<bool> {
@@ -4708,121 +4973,157 @@ impl SearchClient {
         if results.is_empty() {
             return Ok(Vec::new());
         }
-        let sqlite_guard = self.sqlite_guard()?;
-        let conn = sqlite_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
 
-        let placeholder_capacity = results.len().saturating_mul(2).saturating_sub(1);
-        let mut placeholders = String::with_capacity(placeholder_capacity);
-        let mut params: Vec<ParamValue> = Vec::with_capacity(results.len());
-        for (idx, result) in results.iter().enumerate() {
-            if idx > 0 {
-                placeholders.push(',');
+        // Hydration cache fast path. Lookup before SQL — on the daemon
+        // warm path with `prewarm_hydration_cache`, this serves every
+        // hit from in-memory HashMap and bypasses fsqlite entirely
+        // (~30 s saved per cold query on the 872K-row corpus).
+        let hydration_cache = self.semantic_hydration_cache();
+
+        let mut cache_hits: HashMap<u64, Arc<SearchHit>> = HashMap::new();
+        let mut misses: Vec<&VectorSearchResult> = Vec::with_capacity(results.len());
+        if let Some(cache) = hydration_cache.as_ref() {
+            for result in results {
+                match cache.get(result.message_id, field_mask) {
+                    Some(hit) => {
+                        cache_hits.insert(result.message_id, hit);
+                    }
+                    None => misses.push(result),
+                }
             }
-            placeholders.push('?');
-            params.push(ParamValue::from(i64::try_from(result.message_id)?));
+        } else {
+            // No active semantic state (shouldn't happen — we got here from
+            // a semantic path — but handle defensively by going straight to
+            // SQL for every result).
+            misses.extend(results.iter());
         }
 
-        let title_expr = if field_mask.wants_title() {
-            "c.title"
-        } else {
-            "''"
-        };
-        let normalized_source_sql =
-            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-        // LEFT JOIN + COALESCE on agents so search hits for conversations
-        // with NULL agent_id (legacy V1 schema) still surface instead of
-        // being silently dropped from results.  Consistent with the fts/
-        // lexical rebuild paths (8a0c547c, e1c08e7c).
-        let sql = format!(
-            "SELECT m.id, c.id, m.content, m.created_at, m.idx, m.role, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             LEFT JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             LEFT JOIN sources s ON c.source_id = s.id
-             WHERE m.id IN ({placeholders})"
-        );
+        let mut hits_by_id: HashMap<u64, SearchHit> = HashMap::new();
+        if !misses.is_empty() {
+            let sqlite_guard = self.sqlite_guard()?;
+            let conn = sqlite_guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
 
-        let rows: Vec<(u64, SearchHit)> =
-            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
-                let message_id: i64 = row.get_typed(0)?;
-                let conversation_id: i64 = row.get_typed(1)?;
-                let full_content: String = row.get_typed(2)?;
-                let msg_created_at: Option<i64> = row.get_typed(3)?;
-                let idx: Option<i64> = row.get_typed(4)?;
-                let title: Option<String> = if field_mask.wants_title() {
-                    row.get_typed(6)?
-                } else {
-                    None
-                };
-                let source_path: String = row.get_typed(7)?;
-                let raw_source_id: String = row.get_typed(8)?;
-                let origin_host: Option<String> = row.get_typed(9)?;
-                let agent: String = row.get_typed(10)?;
-                let workspace: Option<String> = row.get_typed(11)?;
-                let raw_origin_kind: Option<String> = row.get_typed(12)?;
-                let started_at: Option<i64> = row.get_typed(13)?;
+            let placeholder_capacity = misses.len().saturating_mul(2).saturating_sub(1);
+            let mut placeholders = String::with_capacity(placeholder_capacity);
+            let mut params: Vec<ParamValue> = Vec::with_capacity(misses.len());
+            for (idx, result) in misses.iter().enumerate() {
+                if idx > 0 {
+                    placeholders.push(',');
+                }
+                placeholders.push('?');
+                params.push(ParamValue::from(i64::try_from(result.message_id)?));
+            }
 
-                let created_at = msg_created_at.or(started_at);
-                let line_number = idx
-                    .and_then(|i| usize::try_from(i).ok())
-                    .map(|i| i.saturating_add(1));
-                let snippet = if field_mask.wants_snippet() {
-                    snippet_from_content(&full_content)
-                } else {
-                    String::new()
-                };
-                let content = if field_mask.needs_content() {
-                    full_content.clone()
-                } else {
-                    String::new()
-                };
-                let content_hash =
-                    stable_hit_hash(&full_content, &source_path, line_number, created_at);
-                let source_id = normalized_search_hit_source_id_parts(
-                    raw_source_id.as_str(),
-                    raw_origin_kind.as_deref().unwrap_or_default(),
-                    origin_host.as_deref(),
-                );
-                let origin_kind =
-                    normalized_search_hit_origin_kind(&source_id, raw_origin_kind.as_deref());
+            let title_expr = if field_mask.wants_title() {
+                "c.title"
+            } else {
+                "''"
+            };
+            let normalized_source_sql =
+                normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+            // LEFT JOIN + COALESCE on agents so search hits for conversations
+            // with NULL agent_id (legacy V1 schema) still surface instead of
+            // being silently dropped from results.  Consistent with the fts/
+            // lexical rebuild paths (8a0c547c, e1c08e7c).
+            let sql = format!(
+                "SELECT m.id, c.id, m.content, m.created_at, m.idx, m.role, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 LEFT JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN workspaces w ON c.workspace_id = w.id
+                 LEFT JOIN sources s ON c.source_id = s.id
+                 WHERE m.id IN ({placeholders})"
+            );
 
-                let hit = SearchHit {
-                    title: if field_mask.wants_title() {
-                        title.unwrap_or_default()
+            let rows: Vec<(u64, SearchHit)> =
+                conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                    let message_id: i64 = row.get_typed(0)?;
+                    let conversation_id: i64 = row.get_typed(1)?;
+                    let full_content: String = row.get_typed(2)?;
+                    let msg_created_at: Option<i64> = row.get_typed(3)?;
+                    let idx: Option<i64> = row.get_typed(4)?;
+                    let title: Option<String> = if field_mask.wants_title() {
+                        row.get_typed(6)?
+                    } else {
+                        None
+                    };
+                    let source_path: String = row.get_typed(7)?;
+                    let raw_source_id: String = row.get_typed(8)?;
+                    let origin_host: Option<String> = row.get_typed(9)?;
+                    let agent: String = row.get_typed(10)?;
+                    let workspace: Option<String> = row.get_typed(11)?;
+                    let raw_origin_kind: Option<String> = row.get_typed(12)?;
+                    let started_at: Option<i64> = row.get_typed(13)?;
+
+                    let created_at = msg_created_at.or(started_at);
+                    let line_number = idx
+                        .and_then(|i| usize::try_from(i).ok())
+                        .map(|i| i.saturating_add(1));
+                    let snippet = if field_mask.wants_snippet() {
+                        snippet_from_content(&full_content)
                     } else {
                         String::new()
-                    },
-                    snippet,
-                    content,
-                    content_hash,
-                    conversation_id: Some(conversation_id),
-                    score: 0.0,
-                    source_path,
-                    agent,
-                    workspace: workspace.unwrap_or_default(),
-                    workspace_original: None,
-                    created_at,
-                    line_number,
-                    match_type: MatchType::Exact,
-                    source_id,
-                    origin_kind,
-                    origin_host,
-                };
+                    };
+                    let content = if field_mask.needs_content() {
+                        full_content.clone()
+                    } else {
+                        String::new()
+                    };
+                    let content_hash =
+                        stable_hit_hash(&full_content, &source_path, line_number, created_at);
+                    let source_id = normalized_search_hit_source_id_parts(
+                        raw_source_id.as_str(),
+                        raw_origin_kind.as_deref().unwrap_or_default(),
+                        origin_host.as_deref(),
+                    );
+                    let origin_kind =
+                        normalized_search_hit_origin_kind(&source_id, raw_origin_kind.as_deref());
 
-                Ok((semantic_message_id_from_db(message_id)?, hit))
-            })?;
+                    let hit = SearchHit {
+                        title: if field_mask.wants_title() {
+                            title.unwrap_or_default()
+                        } else {
+                            String::new()
+                        },
+                        snippet,
+                        content,
+                        content_hash,
+                        conversation_id: Some(conversation_id),
+                        score: 0.0,
+                        source_path,
+                        agent,
+                        workspace: workspace.unwrap_or_default(),
+                        workspace_original: None,
+                        created_at,
+                        line_number,
+                        match_type: MatchType::Exact,
+                        source_id,
+                        origin_kind,
+                        origin_host,
+                    };
 
-        let mut hits_by_id = HashMap::new();
-        for (id, hit) in rows {
-            hits_by_id.insert(id, hit);
+                    Ok((semantic_message_id_from_db(message_id)?, hit))
+                })?;
+
+            for (id, hit) in rows {
+                if let Some(cache) = hydration_cache.as_ref() {
+                    cache.put(id, field_mask, Arc::new(hit.clone()));
+                }
+                hits_by_id.insert(id, hit);
+            }
         }
 
-        let mut ordered = Vec::new();
+        let mut ordered = Vec::with_capacity(results.len());
         for result in results {
-            if let Some(mut hit) = hits_by_id.remove(&result.message_id) {
+            let hit_opt: Option<SearchHit> =
+                if let Some(arc) = cache_hits.remove(&result.message_id) {
+                    Some((*arc).clone())
+                } else {
+                    hits_by_id.remove(&result.message_id)
+                };
+            if let Some(mut hit) = hit_opt {
                 hit.score = result.score;
                 ordered.push((result.message_id, hit));
             }
@@ -19913,5 +20214,65 @@ mod tests {
             hit_is_noise(&hit, ""),
             "bare tool-ack 'ok' with content present should still be dropped as noise"
         );
+    }
+
+    fn synth_hit(content: &str, title: &str, snippet: &str) -> Arc<SearchHit> {
+        Arc::new(SearchHit {
+            title: title.to_string(),
+            snippet: snippet.to_string(),
+            content: content.to_string(),
+            content_hash: 0,
+            conversation_id: Some(1),
+            score: 0.0,
+            source_path: "src".to_string(),
+            agent: "codex".to_string(),
+            workspace: "/ws".to_string(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: MatchType::Exact,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        })
+    }
+
+    #[test]
+    fn hydration_cache_round_trips_full_mask_entry() {
+        let cache = HydrationCache::from_env_or_default();
+        let hit = synth_hit("body", "title", "snip");
+        cache.put(42, FieldMask::FULL, hit.clone());
+
+        let got = cache.get(42, FieldMask::FULL).expect("cache hit");
+        assert_eq!(got.title, "title");
+        assert_eq!(got.content, "body");
+        assert_eq!(got.snippet, "snip");
+    }
+
+    #[test]
+    fn hydration_cache_serves_subset_mask_by_trimming_full_entry() {
+        // Worker 8 daemon path always populates with FieldMask::FULL via
+        // `prewarm_hydration_cache`. Subsequent queries may ask for a
+        // narrower mask (e.g. snippet-only). The cache must serve them
+        // from the FULL entry without going back to SQL, trimming the
+        // fields the caller did not request.
+        let cache = HydrationCache::from_env_or_default();
+        let hit = synth_hit("body", "title", "snip");
+        cache.put(99, FieldMask::FULL, hit);
+
+        // Snippet-only request: title and content trimmed.
+        let mask_snippet_only = FieldMask::new(false, true, false, false);
+        let got = cache
+            .get(99, mask_snippet_only)
+            .expect("snippet-only cache hit served from FULL prewarm");
+        assert_eq!(got.snippet, "snip");
+        assert_eq!(got.title, "");
+        assert_eq!(got.content, "");
+    }
+
+    #[test]
+    fn hydration_cache_miss_returns_none() {
+        let cache = HydrationCache::from_env_or_default();
+        assert!(cache.get(7, FieldMask::FULL).is_none());
     }
 }

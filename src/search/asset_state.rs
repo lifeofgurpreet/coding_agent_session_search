@@ -799,7 +799,13 @@ fn semantic_tier_queryable(
     availability: &SemanticAvailability,
     tier: &SemanticTierAssetState,
 ) -> bool {
-    if !tier.ready || tier.current_db_matches != Some(true) {
+    // Fast status/health probes may intentionally skip the DB fingerprint
+    // on large corpora (the fingerprint scan is expensive). Treat unknown
+    // currentness as usable-but-unproven; only a *proven* mismatch should
+    // force lexical fallback. Without this, the daemon's warm semantic
+    // tier flips to "lexical only" every time a status check raced ahead
+    // of the fingerprint, defeating the warm search path.
+    if !tier.ready || tier.current_db_matches == Some(false) {
         return false;
     }
     let Some(embedder_id) = tier.embedder_id.as_deref() else {
@@ -2633,6 +2639,54 @@ mod tests {
             Some(vector_path.as_path())
         );
         assert_eq!(state.hint, None);
+    }
+
+    #[test]
+    fn semantic_state_keeps_ready_hash_tier_searchable_when_currentness_unknown() {
+        // Companion to the `semantic_tier_queryable` softening: when a fast
+        // status probe skips the DB fingerprint scan, `current_db_matches`
+        // ends up as `None`. The warm daemon should still treat the tier as
+        // usable (it was proven ready by the manifest) and not force lexical
+        // fallback. Only a *proven* `Some(false)` mismatch should disqualify
+        // the tier.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut manifest = SemanticManifest {
+            fast_tier: Some(ArtifactRecord {
+                tier: crate::search::semantic_manifest::TierKind::Fast,
+                embedder_id: HashEmbedder::default().id().to_string(),
+                model_revision: "hash".to_string(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                dimension: 256,
+                doc_count: 12,
+                conversation_count: 3,
+                db_fingerprint: "last-proven-db".to_string(),
+                index_path: "vector_index/vector.fast.idx".to_string(),
+                size_bytes: 4096,
+                started_at_ms: 1_733_100_000_000,
+                completed_at_ms: 1_733_100_100_000,
+                ready: true,
+            }),
+            ..Default::default()
+        };
+        manifest.save(temp.path()).expect("save semantic manifest");
+        let vector_path = vector_index_path(temp.path(), HashEmbedder::default().id());
+        std::fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        std::fs::write(&vector_path, b"fast").expect("write fast vector index");
+
+        let state = semantic_state_from_availability(
+            temp.path(),
+            &SemanticAvailability::NeedsConsent,
+            SemanticPreference::DefaultModel,
+            None,
+        );
+
+        assert_eq!(state.status, "ready");
+        assert_eq!(state.availability, "ready");
+        assert!(state.can_search);
+        assert_eq!(state.fast_tier.current_db_matches, None);
+        assert_eq!(state.fallback_mode, None);
     }
 
     #[test]
