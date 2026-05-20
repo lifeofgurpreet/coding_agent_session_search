@@ -15196,6 +15196,13 @@ mod search_lexical_self_heal_tests {
 /// pays the 10-20 s `cli_self_heal` diagnosis-and-fingerprint cost. The
 /// daemon has its own resident SearchClient that doesn't need the CLI to
 /// validate lexical assets on every query.
+fn should_attempt_warm_daemon_search(
+    use_daemon: bool,
+    _requested_mode: crate::search::query::SearchMode,
+) -> bool {
+    use_daemon
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_warm_daemon_search(
     query: &str,
@@ -15561,9 +15568,9 @@ fn run_cli_search(
     let search_start = Instant::now();
 
     // === Architectural daemon-first attempt ==============================
-    // When --use-daemon is set AND the requested mode is not pure lexical,
-    // try the warm daemon BEFORE running `ensure_lexical_assets_for_search`
-    // or `SearchClient::open_with_options`. If the daemon serves the
+    // When --daemon is set, try the warm daemon BEFORE running
+    // `ensure_lexical_assets_for_search` or `SearchClient::open_with_options`
+    // for every search mode, including pure lexical. If the daemon serves the
     // request, the CLI never:
     //   - runs `lexical_storage_fingerprint_for_db` (10-20 s on the Worker
     //     8 corpus),
@@ -15573,13 +15580,13 @@ fn run_cli_search(
     // HNSW pinned via mlock; it does an equivalent lexical health check
     // once at warm-bind time, not per query.
     //
-    // The legacy operator override `CASS_CLI_SKIP_SELF_HEAL=1` still
-    // applies for cases where the daemon is bypassed (e.g. --mode lexical
-    // CLI usage) but the operator still wants the diagnosis skipped. It
-    // remains a belt-and-suspenders flag; the daemon-first reorder is the
-    // primary mechanism.
+    // The legacy operator override `CASS_CLI_SKIP_SELF_HEAL=1` still applies
+    // as a belt-and-suspenders flag when the daemon is unavailable or declined
+    // and the CLI falls through to local search. The daemon-first path is the
+    // primary mechanism for avoiding per-query self-heal and local reader-open
+    // costs.
     let early_daemon_result =
-        if semantic_opts.use_daemon && !matches!(mode_meta.requested, SearchMode::Lexical) {
+        if should_attempt_warm_daemon_search(semantic_opts.use_daemon, mode_meta.requested) {
             try_warm_daemon_search(
                 query,
                 mode_meta.requested,
@@ -86133,6 +86140,27 @@ mod subcommand_robot_output_tests {
         assert!(default_hybrid.fail_open_on_semantic_unavailable());
         assert!(explicit_hybrid.fail_open_on_semantic_unavailable());
         assert!(!explicit_semantic.fail_open_on_semantic_unavailable());
+    }
+
+    #[test]
+    fn warm_daemon_dispatch_includes_lexical_mode() {
+        use crate::search::query::SearchMode;
+
+        for mode in [
+            SearchMode::Lexical,
+            SearchMode::Semantic,
+            SearchMode::Hybrid,
+        ] {
+            assert!(
+                should_attempt_warm_daemon_search(true, mode),
+                "--daemon should attempt warm-daemon search for {mode:?}"
+            );
+        }
+
+        assert!(!should_attempt_warm_daemon_search(
+            false,
+            SearchMode::Lexical
+        ));
     }
 
     #[test]
